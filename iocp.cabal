@@ -21,7 +21,7 @@ source-repository head
 library
     exposed-modules:
         -- IOCP.Manager
-        IOCP.ThreadPool
+        IOCP.Worker
 
     build-tools: hsc2hs
 

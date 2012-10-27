@@ -1,6 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE RecordWildCards #-}
-module IOCP.ThreadPool (    -- Worker
+module IOCP.Worker (
     Worker,
     new,
     enqueue,
