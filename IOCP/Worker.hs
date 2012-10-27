@@ -4,6 +4,9 @@ module IOCP.Worker (
     Worker,
     new,
     enqueue,
+
+    -- * Helpers
+    forkOSUnmasked,
 ) where
 
 import Control.Concurrent
@@ -38,7 +41,7 @@ new = do
 --
 -- Exception safety:  'enqueue' is atomic and non-interruptible, but only if
 -- the caller uses 'Control.Exception.mask'.  @enqueue@ could easily do this by
--- itself, but it doesn't, to avoid a useless 'Control.Exception.mask' call
+-- itself, but it doesn't, to avoid a redundant 'Control.Exception.mask' call
 -- when the caller has other things to do inside an exception mask.
 enqueue :: Worker -> IO () -> IO ()
 enqueue Worker{..} io = do

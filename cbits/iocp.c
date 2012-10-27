@@ -6,7 +6,7 @@ typedef struct _Pending {
 } Pending;
 
 #define toPending(overlappedPtr) \
-    CONTAINING_RECORD(overlappedPtr, Pending, Overlapped);
+    CONTAINING_RECORD(overlappedPtr, Pending, Overlapped)
 
 #define fromPending(pendingPtr) \
     (&(pendingPtr)->Overlapped)
@@ -25,10 +25,11 @@ OVERLAPPED *c_iocp_new_overlapped(UINT64 offset, void *userdata)
     }
 }
 
-static void *finish_overlapped(OVERLAPPED *o)
+void *c_iocp_finish_overlapped(OVERLAPPED *o)
 {
-    void *userdata = toPending(o)->UserData;
-    HeapFree(GetProcessHeap(), 0, o);
+    Pending *p = toPending(o);
+    void *userdata = p->UserData;
+    HeapFree(GetProcessHeap(), 0, p);
     return userdata;
 }
 
@@ -51,6 +52,6 @@ BOOL c_iocp_get_next_completion(HANDLE iocp, DWORD timeout,
     *err_out = ok ? ERROR_SUCCESS : GetLastError();
     if (overlapped == NULL)
         return FALSE;
-    *userdata_out = finish_overlapped(overlapped);
+    *userdata_out = c_iocp_finish_overlapped(overlapped);
     return TRUE;
 }

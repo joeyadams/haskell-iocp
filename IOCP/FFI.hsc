@@ -11,6 +11,7 @@ module IOCP.FFI (
     -- * Overlapped
     Overlapped(..),
     newOverlapped,
+    discardOverlapped,
 
     -- * Miscellaneous
     throwWinErr,
@@ -108,6 +109,14 @@ newOverlapped offset ctx = do
     Win32.failIf (== Overlapped nullPtr) "newOverlapped" $
         c_iocp_new_overlapped offset ptr
 
+foreign import ccall unsafe
+    c_iocp_finish_overlapped :: Overlapped a -> IO (StablePtr a)
+
+-- | Discard an 'Overlapped' object.  This should be called if and only if
+-- no pending I/O was produced after all.
+discardOverlapped :: Overlapped a -> IO ()
+discardOverlapped o = c_iocp_finish_overlapped o >>= freeStablePtr
+
 ------------------------------------------------------------------------
 -- Miscellaneous
 
@@ -124,5 +133,5 @@ throwWinErr loc err = do
     c_SetLastError err
     Win32.failWith loc err
 
-foreign import ccall unsafe "windows.h SetLastError"
+foreign import WINDOWS_CCONV unsafe "windows.h SetLastError"
     c_SetLastError :: ErrCode -> IO ()
