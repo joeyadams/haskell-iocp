@@ -24,6 +24,8 @@ library
         -- IOCP.Manager
         IOCP.Worker
 
+    c-sources: cbits/iocp.c
+
     build-tools: hsc2hs
 
     ghc-options: -Wall -fwarn-tabs -fno-warn-missing-signatures

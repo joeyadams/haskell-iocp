@@ -47,7 +47,7 @@ BOOL c_iocp_get_next_completion(HANDLE iocp, DWORD timeout,
     BOOL ok;
 
     *numBytes_out = 0;
-    ok = GetQueuedCompletionStatus(port, numBytes_out, &completionKey,
+    ok = GetQueuedCompletionStatus(iocp, numBytes_out, &completionKey,
             &overlapped, timeout);
     *err_out = ok ? ERROR_SUCCESS : GetLastError();
     if (overlapped == NULL)
