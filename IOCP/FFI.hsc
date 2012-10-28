@@ -13,6 +13,9 @@ module IOCP.FFI (
     newOverlapped,
     discardOverlapped,
 
+    -- * Cancel pending I/O
+    cancelIo,
+
     -- * Miscellaneous
     throwWinErr,
 ) where
@@ -116,6 +119,19 @@ foreign import ccall unsafe
 -- no pending I/O was produced after all.
 discardOverlapped :: Overlapped a -> IO ()
 discardOverlapped o = c_iocp_finish_overlapped o >>= freeStablePtr
+
+------------------------------------------------------------------------
+-- Cancel pending I/O
+
+-- | CancelIo shouldn't block, but cancellation happens infrequently,
+-- so we might as well be on the safe side.
+foreign import WINDOWS_CCONV safe "windows.h CancelIo"
+    c_CancelIo :: HANDLE -> IO BOOL
+
+-- | Cancel all pending overlapped I/O for the given file that was initiated by
+-- the current OS thread.
+cancelIo :: HANDLE -> IO ()
+cancelIo = Win32.failIfFalse_ "CancelIo" . c_CancelIo
 
 ------------------------------------------------------------------------
 -- Miscellaneous
