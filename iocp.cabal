@@ -21,7 +21,7 @@ source-repository head
 library
     exposed-modules:
         IOCP.FFI
-        -- IOCP.Manager
+        IOCP.Manager
         IOCP.Worker
 
     c-sources: cbits/iocp.c
