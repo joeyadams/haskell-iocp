@@ -9,15 +9,14 @@ module IOCP.Manager (
     associate,
 
     -- * Performing overlapped I/O
-    StartCallback,
-    LPOVERLAPPED,
-    withIOCP,
-
-    -- * Asynchronous interface
     Job,
-    CompletionCallback,
     startJob,
     cancelJob,
+
+    -- ** Types
+    StartCallback,
+    CompletionCallback,
+    LPOVERLAPPED,
 ) where
 
 import IOCP.Worker (Worker, forkOSUnmasked)
@@ -134,15 +133,3 @@ cancelJob job =
     finishJob job $ \w ->
     Worker.enqueue w $
     FFI.cancelIo $ iHandle $ jobHandle job
-
-withIOCP :: IOCPHandle -> Word64 -> StartCallback -> IO (Either ErrCode (ErrCode, DWORD))
-withIOCP iocphandle offset startCB = do
-    mask_ $ do
-        mv <- newEmptyMVar
-        let startCB' h o = do
-                started <- startCB h o
-                when (not started) $ getLastError >>= putMVar mv . Left
-                return started
-            completionCB e b = putMVar mv $ Right (e, b)
-        job <- startJob iocphandle offset startCB' completionCB
-        takeMVar mv `onException` cancelJob job
