@@ -91,6 +91,9 @@ data IOCPHandle = IOCPHandle
     , iPool   :: !(IORef [Worker])
     }
 
+instance Eq IOCPHandle where
+    (==) (IOCPHandle _ a) (IOCPHandle _ b) = a == b
+
 iocpHandle :: IOCPHandle -> HANDLE
 iocpHandle = iHandle
 

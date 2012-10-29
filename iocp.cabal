@@ -23,8 +23,11 @@ library
         IOCP.FFI
         IOCP.Manager
         IOCP.Worker
+        Winsock
 
-    c-sources: cbits/iocp.c
+    c-sources:
+        cbits/iocp.c
+        cbits/Winsock.c
 
     build-tools: hsc2hs
 
@@ -32,3 +35,4 @@ library
 
     build-depends   : base == 4.*
                     , Win32
+                    , network
