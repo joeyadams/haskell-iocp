@@ -3,6 +3,7 @@ module IOCP.Manager (
     -- * Manager
     Manager,
     new,
+    getSystemManager,
 
     -- * IOCPHandle
     IOCPHandle,
@@ -30,8 +31,8 @@ import Data.IORef
 import Data.Word            (Word64)
 import Foreign.Ptr          (Ptr)
 import GHC.Windows          (iNFINITE)
-import System.IO.Unsafe     (unsafeInterleaveIO)
-import System.Win32.Types   (DWORD, ErrCode, HANDLE, getLastError)
+import System.IO.Unsafe     (unsafeInterleaveIO, unsafePerformIO)
+import System.Win32.Types   (DWORD, ErrCode, HANDLE)
 
 data Manager = Manager
     { managerCompletionPort :: !(FFI.IOCP CompletionCallback)
@@ -50,6 +51,16 @@ new = do
             Just (cb, numBytes, errCode) ->
                 cb errCode numBytes
     return Manager{..}
+
+getSystemManager :: IO (Maybe Manager)
+getSystemManager = readIORef managerRef
+
+managerRef :: IORef (Maybe Manager)
+managerRef = unsafePerformIO $
+    if rtsSupportsBoundThreads
+        then new >>= newIORef . Just
+        else newIORef Nothing
+{-# NOINLINE managerRef #-}
 
 -- | Nifty trick to allow each 'IOCPHandle' to allocate workers per concurrent
 -- task, while allowing all 'IOCPHandles' to share the thread pool as a whole.
