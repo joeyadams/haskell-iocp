@@ -8,6 +8,7 @@ module IOCP.Manager (
     -- * IOCPHandle
     IOCPHandle,
     associate,
+    iocpHandle,
 
     -- * Performing overlapped I/O
     Job,
@@ -89,6 +90,9 @@ data IOCPHandle = IOCPHandle
     { iHandle :: !HANDLE
     , iPool   :: !(IORef [Worker])
     }
+
+iocpHandle :: IOCPHandle -> HANDLE
+iocpHandle = iHandle
 
 data Job = Job
     { jobWorker :: !(IORef (Maybe Worker)) -- Used to ensure worker is only released once
