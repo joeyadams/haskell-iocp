@@ -5,6 +5,7 @@
 import Network.Socket hiding (socket, connect)
 import Winsock
 
+import Control.Concurrent   (threadDelay)
 import Control.Monad    (forever)
 import System.Timeout   (timeout)
 
@@ -16,3 +17,7 @@ main = do
         sock <- socket AF_INET Stream defaultProtocol
         addr <- inet_addr googleIP
         connect sock (SockAddrInet 1234 addr)
+        close sock
+
+        -- Avoid making successful connections repeatedly.
+        threadDelay 10000000

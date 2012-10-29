@@ -5,6 +5,7 @@ module Winsock (
     Socket,
     socket,
     connect,
+    close,
 ) where
 
 #include <windows.h>
@@ -38,24 +39,28 @@ import System.Win32.Types
 import qualified Network.Socket     as NS
 import qualified System.Win32.Types as Win32
 
-newtype Socket = Socket IOCPHandle
+data Socket = Socket
+    { _socketIOCP :: !IOCPHandle
+    ,  socketSock :: !SOCKET
+    }
     deriving Eq
 
 socket :: NS.Family -> NS.SocketType -> NS.ProtocolNumber -> IO Socket
 socket family stype protocol = do
     initWinsock
-    sock <- NS.socket family stype protocol
+    sock <- NS.fdSocket <$> NS.socket family stype protocol
     Just mgr <- Manager.getSystemManager
-    Socket <$> Manager.associate mgr (castSocketToHandle sock)
+    iocp <- Manager.associate mgr (wordPtrToPtr $ fromIntegral sock)
+    return $ Socket iocp (fromIntegral sock)
 
 connect :: Socket -> NS.SockAddr -> IO ()
-connect (Socket ih) addr =
+connect (Socket ih sock) addr =
     mask_ $ do
         winsock <- getWinsock
         mv <- newEmptyMVar
-        let startCB h overlapped =
+        let startCB _h overlapped =
                 withSockAddr addr $ \addr_ptr addr_len -> do
-                    ok <- c_winsock_connect winsock (castHANDLEToSOCKET h)
+                    ok <- c_winsock_connect winsock sock
                                             addr_ptr (fromIntegral addr_len)
                                             overlapped
                     if ok then
@@ -70,7 +75,8 @@ connect (Socket ih) addr =
         job <- Manager.startJob ih 0 startCB completionCB
         join (takeMVar mv `onException` Manager.cancelJob job)
 
--- instance IODevice Socket
+close :: Socket -> IO ()
+close = Win32.failIf_ (/= 0) "close" . c_closesocket . socketSock
 
 newtype Winsock = Winsock (Ptr ())
 
@@ -86,17 +92,14 @@ winsockRef = unsafePerformIO (c_winsock_init >>= newIORef)
 
 type SOCKET = #type SOCKET
 
-castSocketToHandle :: NS.Socket -> HANDLE
-castSocketToHandle = wordPtrToPtr . fromIntegral . NS.fdSocket
-
-castHANDLEToSOCKET :: HANDLE -> SOCKET
-castHANDLEToSOCKET = fromIntegral . ptrToWordPtr
-
 foreign import ccall unsafe
     c_winsock_init :: IO Winsock
 
 foreign import ccall unsafe
     c_winsock_connect :: Winsock -> SOCKET -> Ptr NS.SockAddr -> CInt -> LPOVERLAPPED -> IO BOOL
+
+foreign import WINDOWS_CCONV safe "winsock2.h closesocket"
+    c_closesocket :: SOCKET -> IO CInt
 
 tryPutMVar_ :: MVar a -> a -> IO ()
 tryPutMVar_ mv x = void (tryPutMVar mv x)
