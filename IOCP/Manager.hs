@@ -176,19 +176,23 @@ startJob :: IOCPHandle
          -> IO Job
 startJob ih !offset startCB completionCB !errorCB =
     newJob ih $ \job -> do
+        let completionCB' :: CompletionCallback ()
+            completionCB' e b = do
+                completionCB e b `E.catch` errorCB
+                finishJob job (\_ -> return ())
+
         ol@(FFI.Overlapped ptr) <- FFI.newOverlapped offset completionCB'
+
         let handleEx ex = do
+                errorCB ex
                 finishJob job (\_ -> return ())
                 FFI.discardOverlapped ol
-                errorCB ex
+
         r <- withHANDLE ih $ \h -> try $ startCB h ptr
         case r of
             Nothing         -> handleEx $ toException $ userError "startJob: Handle closed"
             Just (Left ex)  -> handleEx ex
             Just (Right ()) -> return ()
-  where
-    completionCB' :: CompletionCallback ()
-    completionCB' e b = completionCB e b `E.catch` errorCB
 
 cancelJob :: Job -> IO ()
 cancelJob job =
