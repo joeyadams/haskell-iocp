@@ -20,14 +20,12 @@ module Winsock (
 ## endif
 ##endif
 
-import IOCP.Manager             (IOCPHandle, LPOVERLAPPED)
+import IOCP.Manager             (IOCPHandle, LPOVERLAPPED, withIOCP)
 import qualified IOCP.FFI     as FFI
 import qualified IOCP.Manager as Manager
 
 import Control.Applicative      ((<$>))
-import Control.Exception
-import Control.Concurrent.MVar
-import Control.Monad            (join, void)
+import Control.Monad            (void)
 import Data.IORef
 import Data.Word
 import Foreign.C
@@ -51,26 +49,20 @@ socket family stype protocol = do
     Socket <$> Manager.associate mgr sockH
 
 connect :: Socket -> NS.SockAddr -> IO ()
-connect (Socket ih) addr =
-    mask_ $ do
-        winsock <- getWinsock
-        mv <- newEmptyMVar
+connect (Socket ih) addr = do
+    winsock <- getWinsock
+    withIOCP ih 0 (startCB winsock) completionCB
+  where
+    startCB winsock handle overlapped =
+        withSockAddr addr $ \addr_ptr addr_len ->
+        Win32.failIfFalse_ "connect" $
+        c_winsock_connect winsock (castHANDLEToSOCKET handle)
+                          addr_ptr (fromIntegral addr_len)
+                          overlapped
 
-        let startCB h overlapped =
-                withSockAddr addr $ \addr_ptr addr_len ->
-                Win32.failIfFalse_ "connect" $
-                c_winsock_connect winsock (castHANDLEToSOCKET h)
-                                  addr_ptr (fromIntegral addr_len)
-                                  overlapped
-
-            completionCB err _numBytes
-                | err == 0  = tryPutMVar_ mv $ return ()
-                | otherwise = FFI.throwWinErr "connect" err
-
-            errorCB = tryPutMVar_ mv . throwIO
-
-        job <- Manager.startJob ih 0 startCB completionCB errorCB
-        join (takeMVar mv `onException` Manager.cancelJob job)
+    completionCB err _numBytes
+        | err == 0  = return ()
+        | otherwise = FFI.throwWinErr "connect" err
 
 close :: Socket -> IO ()
 close (Socket ih) =
@@ -105,6 +97,3 @@ foreign import ccall unsafe
 
 foreign import WINDOWS_CCONV safe "winsock2.h closesocket"
     c_closesocket :: SOCKET -> IO CInt
-
-tryPutMVar_ :: MVar a -> a -> IO ()
-tryPutMVar_ mv x = void (tryPutMVar mv x)

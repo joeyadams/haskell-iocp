@@ -13,15 +13,16 @@ module IOCP.Manager (
     closeWith,
 
     -- * Performing overlapped I/O
-    Job,
-    startJob,
-    cancelJob,
-
-    -- ** Types
+    withIOCP,
     StartCallback,
     CompletionCallback,
-    ErrorCallback,
     LPOVERLAPPED,
+
+    -- ** Asynchronous interface
+    Job,
+    startJob,
+    ErrorCallback,
+    cancelJob,
 ) where
 
 import IOCP.Worker (Worker, forkOSUnmasked)
@@ -30,7 +31,7 @@ import qualified IOCP.Worker as Worker
 
 import Control.Concurrent
 import Control.Exception as E
-import Control.Monad        (forever, void)
+import Control.Monad        (forever, join, void)
 import Data.IORef
 import Data.Word            (Word64)
 import Foreign.Ptr          (Ptr)
@@ -39,7 +40,7 @@ import System.IO.Unsafe     (unsafeInterleaveIO, unsafePerformIO)
 import System.Win32.Types   (DWORD, ErrCode, HANDLE)
 
 data Manager = Manager
-    { managerCompletionPort :: !(FFI.IOCP CompletionCallback)
+    { managerCompletionPort :: !(FFI.IOCP (CompletionCallback ()))
     , managerThreadPool     :: [Worker]
     }
 
@@ -156,9 +157,9 @@ type LPOVERLAPPED = Ptr ()
 -- Otherwise, it must throw an exception.
 type StartCallback = HANDLE -> LPOVERLAPPED -> IO ()
 
-type CompletionCallback = ErrCode   -- ^ 0 indicates success
-                       -> DWORD     -- ^ Number of bytes transferred
-                       -> IO ()
+type CompletionCallback a = ErrCode   -- ^ 0 indicates success
+                         -> DWORD     -- ^ Number of bytes transferred
+                         -> IO a
 
 -- | What to do if an error occurred.  This is called when:
 --
@@ -168,9 +169,9 @@ type CompletionCallback = ErrCode   -- ^ 0 indicates success
 type ErrorCallback = SomeException -> IO ()
 
 startJob :: IOCPHandle
-         -> Word64              -- ^ Offset/OffsetHigh
+         -> Word64                  -- ^ Offset/OffsetHigh
          -> StartCallback
-         -> CompletionCallback
+         -> CompletionCallback ()
          -> ErrorCallback
          -> IO Job
 startJob ih !offset startCB completionCB !errorCB =
@@ -186,7 +187,7 @@ startJob ih !offset startCB completionCB !errorCB =
             Just (Left ex)  -> handleEx ex
             Just (Right ()) -> return ()
   where
-    completionCB' :: CompletionCallback
+    completionCB' :: CompletionCallback ()
     completionCB' e b = completionCB e b `E.catch` errorCB
 
 cancelJob :: Job -> IO ()
@@ -196,3 +197,16 @@ cancelJob job =
     Worker.enqueue w $
     void $ withHANDLE (jobHandle job) $ \h ->
     FFI.cancelIo h
+
+withIOCP :: IOCPHandle
+         -> Word64                  -- ^ Offset/OffsetHigh
+         -> StartCallback
+         -> CompletionCallback a
+         -> IO a
+withIOCP ih offset startCB completionCB =
+    mask_ $ do
+        mv <- newEmptyMVar
+        let completionCB' e b = completionCB e b >>= putMVar mv . return
+            errorCB = putMVar mv . throwIO
+        job <- startJob ih offset startCB completionCB' errorCB
+        join $ takeMVar mv `onException` cancelJob job
