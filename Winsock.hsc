@@ -39,44 +39,43 @@ import System.Win32.Types
 import qualified Network.Socket     as NS
 import qualified System.Win32.Types as Win32
 
-data Socket = Socket
-    { _socketIOCP :: !IOCPHandle
-    ,  socketSock :: !SOCKET
-    }
+newtype Socket = Socket IOCPHandle
     deriving Eq
 
 socket :: NS.Family -> NS.SocketType -> NS.ProtocolNumber -> IO Socket
 socket family stype protocol = do
     initWinsock
-    sock <- NS.fdSocket <$> NS.socket family stype protocol
+    sockH <- wordPtrToPtr . fromIntegral . NS.fdSocket
+         <$> NS.socket family stype protocol
     Just mgr <- Manager.getSystemManager
-    iocp <- Manager.associate mgr (wordPtrToPtr $ fromIntegral sock)
-    return $ Socket iocp (fromIntegral sock)
+    Socket <$> Manager.associate mgr sockH
 
 connect :: Socket -> NS.SockAddr -> IO ()
-connect (Socket ih sock) addr =
+connect (Socket ih) addr =
     mask_ $ do
         winsock <- getWinsock
         mv <- newEmptyMVar
-        let startCB _h overlapped =
-                withSockAddr addr $ \addr_ptr addr_len -> do
-                    ok <- c_winsock_connect winsock sock
-                                            addr_ptr (fromIntegral addr_len)
-                                            overlapped
-                    if ok then
-                        return True
-                    else do
-                        err <- Win32.getLastError
-                        tryPutMVar_ mv $ FFI.throwWinErr "connect" err
-                        return False
+
+        let startCB h overlapped =
+                withSockAddr addr $ \addr_ptr addr_len ->
+                Win32.failIfFalse_ "connect" $
+                c_winsock_connect winsock (castHANDLEToSOCKET h)
+                                  addr_ptr (fromIntegral addr_len)
+                                  overlapped
+
             completionCB err _numBytes
                 | err == 0  = tryPutMVar_ mv $ return ()
-                | otherwise = tryPutMVar_ mv $ FFI.throwWinErr "connect" err
-        job <- Manager.startJob ih 0 startCB completionCB
+                | otherwise = FFI.throwWinErr "connect" err
+
+            errorCB = tryPutMVar_ mv . throwIO
+
+        job <- Manager.startJob ih 0 startCB completionCB errorCB
         join (takeMVar mv `onException` Manager.cancelJob job)
 
 close :: Socket -> IO ()
-close = Win32.failIf_ (/= 0) "close" . c_closesocket . socketSock
+close (Socket ih) =
+    Manager.closeWith ih $
+    Win32.failIf_ (/= 0) "close" . c_closesocket . castHANDLEToSOCKET
 
 newtype Winsock = Winsock (Ptr ())
 
@@ -91,6 +90,12 @@ winsockRef = unsafePerformIO (c_winsock_init >>= newIORef)
 {-# NOINLINE winsockRef #-}
 
 type SOCKET = #type SOCKET
+
+-- castSOCKETToHANDLE :: SOCKET -> HANDLE
+-- castSOCKETToHANDLE = wordPtrToPtr . fromIntegral
+
+castHANDLEToSOCKET :: HANDLE -> SOCKET
+castHANDLEToSOCKET = fromIntegral . ptrToWordPtr
 
 foreign import ccall unsafe
     c_winsock_init :: IO Winsock
