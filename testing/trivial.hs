@@ -17,7 +17,7 @@ main = do
         putStrLn "Connecting"
         sock <- socket AF_INET Stream defaultProtocol
         addr <- inet_addr googleIP
-        connect sock (SockAddrInet 1234 addr) `finally` close sock
+        connect sock (SockAddrInet 1234 addr) `finally` Winsock.close sock
 
         -- Avoid making successful connections repeatedly.
         threadDelay 10000000
