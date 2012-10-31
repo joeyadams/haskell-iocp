@@ -28,7 +28,7 @@ new = do
     workerJobs <- newIORef id
     workerWake <- newEmptyMVar
     _ <- forkOSUnmasked $ forever $ do
-        _ <- takeMVar workerWake
+        takeMVar workerWake
         jobs <- atomicModifyIORef workerJobs $ \jobs -> (id, jobs)
         runJobList jobs
     return Worker{..}
