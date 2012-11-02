@@ -104,18 +104,6 @@ fail1:
     return NULL;
 }
 
-static BOOL bind_inet(SOCKET sock, ULONG address, USHORT port)
-{
-    struct sockaddr_in addr;
-    int rc;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = address;
-    addr.sin_port        = port;
-    rc = bind(sock, (SOCKADDR *) &addr, sizeof(addr));
-    return (rc == 0);
-}
-
 BOOL c_winsock_connect(Winsock *winsock, SOCKET sock, SOCKADDR *addr, int addrLen, OVERLAPPED *ol)
 {
     // ConnectEx requires the socket to be initially bound.
@@ -133,4 +121,19 @@ BOOL c_winsock_connect(Winsock *winsock, SOCKET sock, SOCKADDR *addr, int addrLe
 
     BOOL ok = winsock->ConnectEx(sock, addr, addrLen, NULL, 0, NULL, ol);
     return (ok || WSAGetLastError() == ERROR_IO_PENDING);
+}
+
+BOOL c_winsock_recv(SOCKET sock, char *buf, u_long bufsize, OVERLAPPED *ol)
+{
+    WSABUF wsabuf = {.len = bufsize, .buf = buf};
+    DWORD flags = 0;
+    int rc = WSARecv(sock, &wsabuf, 1, NULL, &flags, ol, NULL);
+    return (rc == 0 || WSAGetLastError() == ERROR_IO_PENDING);
+}
+
+BOOL c_winsock_send(SOCKET sock, char *buf, u_long bufsize, OVERLAPPED *ol)
+{
+    WSABUF wsabuf = {.len = bufsize, .buf = buf};
+    int rc = WSASend(sock, &wsabuf, 1, NULL, 0, ol, NULL);
+    return (rc == 0 || WSAGetLastError() == ERROR_IO_PENDING);
 }

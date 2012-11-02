@@ -32,7 +32,9 @@ library
     build-tools: hsc2hs
 
     ghc-options: -Wall -fwarn-tabs -fno-warn-missing-signatures
+    cc-options: -Wall
 
     build-depends   : base == 4.*
+                    , bytestring
                     , Win32
                     , network

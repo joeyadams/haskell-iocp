@@ -6,6 +6,11 @@ module Winsock (
     socket,
     connect,
     close,
+    recvBuf,
+    sendBuf,
+
+    recv,
+    send,
 ) where
 
 #include <windows.h>
@@ -26,6 +31,9 @@ import qualified IOCP.Manager as Manager
 
 import Control.Applicative      ((<$>))
 import Control.Monad            (void)
+import Data.ByteString          (ByteString)
+import Data.ByteString.Internal (createAndTrim)
+import Data.ByteString.Unsafe   (unsafeUseAsCStringLen)
 import Data.IORef
 import Data.Word
 import Foreign.C
@@ -39,6 +47,8 @@ import qualified System.Win32.Types as Win32
 
 newtype Socket = Socket IOCPHandle
     deriving Eq
+
+-- Note: Functions that take a 'Socket' expect WinSock to already be initialized.
 
 socket :: NS.Family -> NS.SocketType -> NS.ProtocolNumber -> IO Socket
 socket family stype protocol = do
@@ -69,6 +79,40 @@ close (Socket ih) =
     Manager.closeWith ih $
     Win32.failIf_ (/= 0) "close" . c_closesocket . castHANDLEToSOCKET
 
+recvBuf :: Socket -> Ptr a -> Int -> IO Int
+recvBuf (Socket ih) buf len =
+    withIOCP ih 0 startCB completionCB
+  where
+    startCB h ol =
+        Win32.failIfFalse_ "recv" $
+        c_winsock_recv (castHANDLEToSOCKET h) (castPtr buf) (fromIntegral len) ol
+
+    completionCB err numBytes
+        | err == 0  = return (fromIntegral numBytes)
+        | otherwise = FFI.throwWinErr "recv" err
+
+sendBuf :: Socket -> Ptr a -> Int -> IO Int
+sendBuf (Socket ih) buf len =
+    withIOCP ih 0 startCB completionCB
+  where
+    startCB h ol =
+        Win32.failIfFalse_ "send" $
+        c_winsock_send (castHANDLEToSOCKET h) (castPtr buf) (fromIntegral len) ol
+
+    completionCB err numBytes
+        | err == 0  = return (fromIntegral numBytes)
+        | otherwise = FFI.throwWinErr "send" err
+
+recv :: Socket -> Int -> IO ByteString
+recv sock len =
+    createAndTrim len $ \buf ->
+    recvBuf sock buf len
+
+send :: Socket -> ByteString -> IO Int
+send sock bs =
+    unsafeUseAsCStringLen bs $ \(buf, len) ->
+    sendBuf sock buf len
+
 newtype Winsock = Winsock (Ptr ())
 
 getWinsock :: IO Winsock
@@ -97,3 +141,9 @@ foreign import ccall unsafe
 
 foreign import WINDOWS_CCONV safe "winsock2.h closesocket"
     c_closesocket :: SOCKET -> IO CInt
+
+foreign import ccall unsafe
+    c_winsock_recv :: SOCKET -> Ptr CChar -> #{type u_long} -> LPOVERLAPPED -> IO BOOL
+
+foreign import ccall unsafe
+    c_winsock_send :: SOCKET -> Ptr CChar -> #{type u_long} -> LPOVERLAPPED -> IO BOOL
