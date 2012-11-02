@@ -48,7 +48,7 @@ import qualified System.Win32.Types as Win32
 newtype Socket = Socket IOCPHandle
     deriving Eq
 
--- Note: Functions that take a 'Socket' expect WinSock to already be initialized.
+-- Note: Functions that take a 'Socket' expect Winsock to already be initialized.
 
 socket :: NS.Family -> NS.SocketType -> NS.ProtocolNumber -> IO Socket
 socket family stype protocol = do
