@@ -2,15 +2,18 @@
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ForeignFunctionInterface #-}
 module Winsock (
-    Socket,
+    Socket(..),
     socket,
     connect,
+    shutdown,
     close,
     recvBuf,
     sendBuf,
 
     recv,
     send,
+
+    withSocket,
 ) where
 
 #include <windows.h>
@@ -74,6 +77,17 @@ connect (Socket ih) addr = do
         | err == 0  = return ()
         | otherwise = FFI.throwWinErr "connect" err
 
+shutdown :: Socket -> NS.ShutdownCmd -> IO ()
+shutdown sock how =
+    Win32.failIf_ (/= 0) "shutdown" $
+    withSocket sock $ \s ->
+    c_shutdown s (sdownCmdToInt how)
+
+sdownCmdToInt :: NS.ShutdownCmd -> CInt
+sdownCmdToInt NS.ShutdownReceive = #const SD_RECEIVE
+sdownCmdToInt NS.ShutdownSend    = #const SD_SEND
+sdownCmdToInt NS.ShutdownBoth    = #const SD_BOTH
+
 close :: Socket -> IO ()
 close (Socket ih) =
     Manager.closeWith ih $
@@ -113,6 +127,14 @@ send sock bs =
     unsafeUseAsCStringLen bs $ \(buf, len) ->
     sendBuf sock buf len
 
+-- | Operate on the underlying file descriptor.  Throw an exception if the
+-- socket has been closed.  This uses 'Manager.withHANDLE', so the same
+-- caveats apply.
+withSocket :: Socket -> (SOCKET -> IO a) -> IO a
+withSocket (Socket iocp) cb =
+    Manager.withHANDLE iocp (cb . castHANDLEToSOCKET)
+        >>= maybe (fail "withSocket: socket closed") return
+
 newtype Winsock = Winsock (Ptr ())
 
 getWinsock :: IO Winsock
@@ -138,6 +160,9 @@ foreign import ccall unsafe
 
 foreign import ccall unsafe
     c_winsock_connect :: Winsock -> SOCKET -> Ptr NS.SockAddr -> CInt -> LPOVERLAPPED -> IO BOOL
+
+foreign import WINDOWS_CCONV safe "winsock2.h shutdown"
+    c_shutdown :: SOCKET -> CInt -> IO CInt
 
 foreign import WINDOWS_CCONV safe "winsock2.h closesocket"
     c_closesocket :: SOCKET -> IO CInt
