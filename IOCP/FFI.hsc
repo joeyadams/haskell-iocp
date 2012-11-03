@@ -7,6 +7,7 @@ module IOCP.FFI (
     newIOCP,
     associateHandleWithIOCP,
     getNextCompletion,
+    postCompletion,
 
     -- * Overlapped
     Overlapped(..),
@@ -87,6 +88,14 @@ getNextCompletion iocp timeout =
             return Nothing
         else
             Win32.failWith "GetQueuedCompletionStatus" err
+
+foreign import WINDOWS_CCONV unsafe "windows.h PostQueuedCompletionStatus"
+    c_PostQueuedCompletionStatus :: IOCP a -> DWORD -> ULONG_PTR -> Overlapped a -> IO BOOL
+
+postCompletion :: IOCP a -> DWORD -> Overlapped a -> IO ()
+postCompletion iocp numBytes ol =
+    Win32.failIfFalse_ "PostQueuedCompletionStatus" $
+    c_PostQueuedCompletionStatus iocp numBytes 0 ol
 
 ------------------------------------------------------------------------
 -- Overlapped

@@ -34,9 +34,11 @@ import System.IO.Unsafe     (unsafeInterleaveIO, unsafePerformIO)
 import System.Win32.Types   (DWORD, ErrCode, HANDLE)
 
 data Manager = Manager
-    { managerCompletionPort :: !(FFI.IOCP (CompletionCallback ()))
+    { managerCompletionPort :: !ManagerCompletionPort
     , managerThreadPool     :: WorkerList
     }
+
+type ManagerCompletionPort = FFI.IOCP (CompletionCallback ())
 
 data WorkerList = WL !Worker WorkerList
 
@@ -76,16 +78,31 @@ associate :: Manager -> HANDLE -> IO IOCPHandle
 associate Manager{..} h = do
     FFI.associateHandleWithIOCP managerCompletionPort h
     iHandle <- newMVar $ IOCPOpen h
-    iPool   <- newIORef managerThreadPool
+    iPool   <- newIORef $ PoolState (Just managerCompletionPort) managerThreadPool
     return IOCPHandle{..}
 
 data IOCPHandle = IOCPHandle
     { iHandle :: !(MVar IOCPState)
-    , iPool   :: !(IORef WorkerList)
+    , iPool   :: !(IORef PoolState)
     }
 
 data IOCPState = IOCPOpen !HANDLE
                | IOCPClosed
+
+-- | Used to allocate worker threads for I/O requests.  The rule is: a handle
+-- may not use the same worker for two simultaneous operations (however,
+-- multiple handles may share the same worker).  This is because CancelIo
+-- cancels all pending I/O for a given handle in the current thread.
+-- CancelIoEx lets us specify an individual operation to cancel, but it was
+-- introduced in Windows Vista.
+--
+-- Whenever we can, we queue jobs to the completion handler using
+-- PostQueuedCompletionStatus.  This is about 30% faster than using a separate
+-- worker thread, as it avoids a context switch.
+data PoolState = PoolState
+    { pCompletionPort :: !(Maybe ManagerCompletionPort)
+    , pWorkers        :: WorkerList
+    }
 
 instance Eq IOCPHandle where
     (==) (IOCPHandle a _) (IOCPHandle b _) = a == b
@@ -113,14 +130,29 @@ withHANDLE h = withHANDLE' id h
 closeWith :: IOCPHandle -> (HANDLE -> IO ()) -> IO ()
 closeWith h = void . withHANDLE' (\_ -> IOCPClosed) h
 
-withWorkerAndMask :: IOCPHandle -> (Worker -> IO a) -> IO a
-withWorkerAndMask IOCPHandle{..} cb =
+withWorkerAndMask :: IOCPHandle -> ((IO () -> IO ()) -> IO a) -> IO a
+withWorkerAndMask IOCPHandle{..} =
+    withIORefAndMask grab iPool
+  where
+    grab ps@PoolState{..} = case pCompletionPort of
+        Just cp -> (ps{pCompletionPort = Nothing}, (releaseCP cp, postCP cp))
+        Nothing -> case pWorkers of
+            WL w ws -> (ps{pWorkers = ws}, (releaseWorker w, Worker.enqueue w))
+
+    releaseCP cp ps = ps{pCompletionPort = Just cp}
+    releaseWorker w ps = ps{pWorkers = WL w (pWorkers ps)}
+
+    postCP cp io = FFI.newOverlapped 0 (\_errCode _numBytes -> io)
+               >>= FFI.postCompletion cp 0
+
+withIORefAndMask :: (s -> (s, (s -> s, a))) -> IORef s -> (a -> IO b) -> IO b
+withIORefAndMask grabF ref cb =
     mask_ $ do
-        w <- atomicModifyIORef iPool (\(WL w ws) -> (ws, w))
-        let release = atomicModifyIORef iPool (\ws -> (WL w ws, ()))
-        a <- (evaluate w >> cb w) `onException` release
+        (releaseF, a) <- atomicModifyIORef ref grabF
+        let release = atomicModifyIORef ref (\s -> (releaseF s, ()))
+        b <- cb a `onException` release
         release
-        return a
+        return b
 
 type LPOVERLAPPED = Ptr ()
 
@@ -142,12 +174,12 @@ withIOCP :: IOCPHandle
          -> CompletionCallback a
          -> IO a
 withIOCP ih@IOCPHandle{..} offset startCB completionCB =
-    withWorkerAndMask ih $ \w -> do
+    withWorkerAndMask ih $ \enqueue -> do
         signal <- newEmptyMVar
         let signalReturn a = void $ tryPutMVar signal $ return a
             signalThrow ex = void $ tryPutMVar signal $ throwIO (ex :: SomeException)
 
-        Worker.enqueue w $ do
+        enqueue $ do
             s <- takeMVar iHandle
             case s of
                 IOCPClosed -> do
@@ -168,7 +200,7 @@ withIOCP ih@IOCPHandle{..} offset startCB completionCB =
                         Right _ -> return ()
 
         let cancel = uninterruptibleMask_ $ do
-                Worker.enqueue w $ void $ withHANDLE ih FFI.cancelIo
+                enqueue $ void $ withHANDLE ih FFI.cancelIo
                 takeMVar signal
 
         join (takeMVar signal `onException` cancel)
