@@ -10,6 +10,7 @@ module IOCP.Manager (
     IOCPHandle,
     associate,
     withHANDLE,
+    withHANDLEThrow,
     closeWith,
 
     -- * Performing overlapped I/O
@@ -135,6 +136,14 @@ withHANDLE' f IOCPHandle{..} cb =
 withHANDLE :: IOCPHandle -> (HANDLE -> IO a) -> IO (Maybe a)
 withHANDLE h = withHANDLE' id h
 
+-- | Like withHANDLE, but if the handle is closed, throw an exception instead
+-- of returning 'Nothing'.
+withHANDLEThrow :: IOCPHandle -> (HANDLE -> IO a) -> IO a
+withHANDLEThrow h cb = withHANDLE h cb >>= maybe (throwIO closedError) return
+
+closedError :: IOError
+closedError = userError "IOCPHandle closed"
+
 -- | Close the underlying 'HANDLE' using the given callback.  Afterward,
 -- 'withIOCP' will throw an exception, and 'closeWith' will do nothing.
 closeWith :: IOCPHandle -> (HANDLE -> IO ()) -> IO ()
@@ -214,6 +223,3 @@ withIOCP ih@IOCPHandle{..} offset startCB completionCB =
                 takeMVar signal
 
         join (takeMVar signal `onException` cancel)
-
-closedError :: IOError
-closedError = userError "HANDLE closed"
