@@ -121,7 +121,17 @@ withHANDLE' f IOCPHandle{..} cb =
                 return Nothing
 
 -- | Operate on the underlying 'HANDLE', or do nothing and return 'Nothing' if
--- the handle is closed.
+-- the handle is closed.  Note the following:
+--
+--  * If the callback blocks, it will block other threads from
+--    accessing the handle.
+--
+--  * Blocking FFI calls cannot be interrupted by asynchronous exceptions.
+--    To do a blocking operation on an 'IOCPHandle', see if there is a system
+--    call that supports overlapped I/O, and use 'withIOCP' instead.
+--
+--  * It is unsafe to use the 'HANDLE' outside of the callback, unless you
+--    can ensure that the handle will not be 'close'd until you are done with it.
 withHANDLE :: IOCPHandle -> (HANDLE -> IO a) -> IO (Maybe a)
 withHANDLE h = withHANDLE' id h
 
