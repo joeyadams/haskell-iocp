@@ -27,6 +27,7 @@ import Control.Exception as E
 import Control.Monad        (forever, join, void)
 import Data.IORef
 import Data.Word            (Word64)
+import Debug.Trace          (traceIO)
 import Foreign.Ptr          (Ptr)
 import GHC.Windows          (iNFINITE)
 import System.IO.Unsafe     (unsafeInterleaveIO, unsafePerformIO)
@@ -170,7 +171,19 @@ withIOCP ih@IOCPHandle{..} offset startCB completionCB =
                 signalThrow ex
 
         let cancel = uninterruptibleMask_ $ do
-                enqueue $ FFI.cancelIo iHandle
-                takeMVar signal
+                cancelLock <- newMVar ()
+                    -- Used to prevent our CancelIo from running after
+                    -- 'withIOCP' has exited.
+                enqueue $ do
+                    m <- tryTakeMVar cancelLock
+                    case m of
+                        Nothing -> return ()
+                        Just () -> do
+                            FFI.cancelIo iHandle `E.catch` \ex -> do
+                                traceIO $ "CancelIo failed: " ++ show (ex :: SomeException)
+                                signalThrow ex
+                            putMVar cancelLock ()
+                _ <- takeMVar signal
+                takeMVar cancelLock
 
         join (takeMVar signal `onException` cancel)
