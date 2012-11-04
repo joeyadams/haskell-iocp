@@ -145,11 +145,19 @@ type CompletionCallback a = ErrCode   -- ^ 0 indicates success
                          -> DWORD     -- ^ Number of bytes transferred
                          -> IO a
 
--- |
+-- | Start an overlapped I/O operation, and wait for its completion.  If
+-- 'withIOCP' is interrupted by an asynchronous exception, the operation
+-- will be canceled using @CancelIo@.
+--
+-- 'withIOCP' waits for a completion to arrive before returning or throwing an
+-- exception.  This means you can use functions like
+-- 'Foreign.Marshal.Alloc.alloca' to allocate buffers for the overlapped
+-- operation.
 --
 -- The underlying 'HANDLE' must not be closed while 'withIOCP' is in progress.
 withIOCP :: IOCPHandle
-         -> Word64                  -- ^ Offset/OffsetHigh
+         -> Word64                  -- ^ Value to use for the @OVERLAPPED@
+                                    --   structure's Offset/OffsetHigh members.
          -> StartCallback
          -> CompletionCallback a
          -> IO a

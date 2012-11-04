@@ -3,6 +3,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 module Winsock (
     Socket(..),
+    SOCKET,
     sockFd,
     socket,
     connect,
