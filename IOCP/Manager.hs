@@ -9,9 +9,7 @@ module IOCP.Manager (
     -- * IOCPHandle
     IOCPHandle,
     associate,
-    withHANDLE,
-    withHANDLEThrow,
-    closeWith,
+    iHANDLE,
 
     -- * Performing overlapped I/O
     withIOCP,
@@ -78,17 +76,20 @@ newThreadPool = unsafeInterleaveIO $ do
 associate :: Manager -> HANDLE -> IO IOCPHandle
 associate Manager{..} h = do
     FFI.associateHandleWithIOCP managerCompletionPort h
-    iHandle <- newMVar $ IOCPOpen h
-    iPool   <- newIORef $ PoolState (Just managerCompletionPort) managerThreadPool
-    return IOCPHandle{..}
+    iPool <- newIORef $ PoolState (Just managerCompletionPort) managerThreadPool
+    return IOCPHandle{iHandle = h, ..}
 
 data IOCPHandle = IOCPHandle
-    { iHandle :: !(MVar IOCPState)
-    , iPool   :: !(IORef PoolState)
+    { iHandle   :: !HANDLE
+    , iPool     :: !(IORef PoolState)
     }
 
-data IOCPState = IOCPOpen !HANDLE
-               | IOCPClosed
+instance Eq IOCPHandle where
+    (==) (IOCPHandle _ a) (IOCPHandle _ b) = a == b
+
+-- | Get the underlying 'HANDLE'.
+iHANDLE :: IOCPHandle -> HANDLE
+iHANDLE = iHandle
 
 -- | Used to allocate worker threads for I/O requests.  The rule is: a handle
 -- may not use the same worker for two simultaneous operations (however,
@@ -104,50 +105,6 @@ data PoolState = PoolState
     { pCompletionPort :: !(Maybe ManagerCompletionPort)
     , pWorkers        :: WorkerList
     }
-
-instance Eq IOCPHandle where
-    (==) (IOCPHandle a _) (IOCPHandle b _) = a == b
-
-withHANDLE' :: (IOCPState -> IOCPState) -> IOCPHandle -> (HANDLE -> IO a) -> IO (Maybe a)
-withHANDLE' f IOCPHandle{..} cb =
-    mask_ $ do
-        m <- takeMVar iHandle
-        case m of
-            IOCPOpen h -> do
-                a <- cb h `onException` putMVar iHandle m
-                putMVar iHandle (f m)
-                return (Just a)
-            IOCPClosed -> do
-                putMVar iHandle m
-                return Nothing
-
--- | Operate on the underlying 'HANDLE', or do nothing and return 'Nothing' if
--- the handle is closed.  Note the following:
---
---  * If the callback blocks, it will block other threads from
---    accessing the handle.
---
---  * Blocking FFI calls cannot be interrupted by asynchronous exceptions.
---    To do a blocking operation on an 'IOCPHandle', see if there is a system
---    call that supports overlapped I/O, and use 'withIOCP' instead.
---
---  * It is unsafe to use the 'HANDLE' outside of the callback, unless you
---    can ensure that the handle will not be 'close'd until you are done with it.
-withHANDLE :: IOCPHandle -> (HANDLE -> IO a) -> IO (Maybe a)
-withHANDLE h = withHANDLE' id h
-
--- | Like withHANDLE, but if the handle is closed, throw an exception instead
--- of returning 'Nothing'.
-withHANDLEThrow :: IOCPHandle -> (HANDLE -> IO a) -> IO a
-withHANDLEThrow h cb = withHANDLE h cb >>= maybe (throwIO closedError) return
-
-closedError :: IOError
-closedError = userError "IOCPHandle closed"
-
--- | Close the underlying 'HANDLE' using the given callback.  Afterward,
--- 'withIOCP' will throw an exception, and 'closeWith' will do nothing.
-closeWith :: IOCPHandle -> (HANDLE -> IO ()) -> IO ()
-closeWith h = void . withHANDLE' (\_ -> IOCPClosed) h
 
 withWorkerAndMask :: IOCPHandle -> ((IO () -> IO ()) -> IO a) -> IO a
 withWorkerAndMask IOCPHandle{..} =
@@ -187,6 +144,9 @@ type CompletionCallback a = ErrCode   -- ^ 0 indicates success
                          -> DWORD     -- ^ Number of bytes transferred
                          -> IO a
 
+-- |
+--
+-- The underlying 'HANDLE' must not be closed while 'withIOCP' is in progress.
 withIOCP :: IOCPHandle
          -> Word64                  -- ^ Offset/OffsetHigh
          -> StartCallback
@@ -199,27 +159,18 @@ withIOCP ih@IOCPHandle{..} offset startCB completionCB =
             signalThrow ex = void $ tryPutMVar signal $ throwIO (ex :: SomeException)
 
         enqueue $ do
-            s <- takeMVar iHandle
-            case s of
-                IOCPClosed -> do
-                    putMVar iHandle s
-                    signalThrow $ toException closedError
-                IOCPOpen h -> do
-                    let completionCB' :: CompletionCallback ()
-                        completionCB' e b =
-                            (completionCB e b >>= signalReturn) `E.catch` signalThrow
+            let completionCB' :: CompletionCallback ()
+                completionCB' e b =
+                    (completionCB e b >>= signalReturn) `E.catch` signalThrow
 
-                    ol@(FFI.Overlapped ptr) <- FFI.newOverlapped offset completionCB'
-                    res <- try $ startCB h ptr
-                    putMVar iHandle s
-                    case res of
-                        Left ex -> do
-                            FFI.discardOverlapped ol
-                            signalThrow ex
-                        Right _ -> return ()
+            ol@(FFI.Overlapped ptr) <- FFI.newOverlapped offset completionCB'
+
+            startCB iHandle ptr `E.catch` \ex -> do
+                FFI.discardOverlapped ol
+                signalThrow ex
 
         let cancel = uninterruptibleMask_ $ do
-                enqueue $ void $ withHANDLE ih FFI.cancelIo
+                enqueue $ FFI.cancelIo iHandle
                 takeMVar signal
 
         join (takeMVar signal `onException` cancel)

@@ -3,6 +3,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 module Winsock (
     Socket(..),
+    sockFd,
     socket,
     connect,
     shutdown,
@@ -12,8 +13,6 @@ module Winsock (
 
     recv,
     send,
-
-    withSocket,
 ) where
 
 #include <windows.h>
@@ -28,7 +27,7 @@ module Winsock (
 ## endif
 ##endif
 
-import IOCP.Manager             (IOCPHandle, LPOVERLAPPED, withIOCP)
+import IOCP.Manager             (IOCPHandle, iHANDLE, LPOVERLAPPED, withIOCP)
 import qualified IOCP.FFI     as FFI
 import qualified IOCP.Manager as Manager
 
@@ -48,8 +47,12 @@ import System.Win32.Types
 import qualified Network.Socket     as NS
 import qualified System.Win32.Types as Win32
 
-newtype Socket = Socket IOCPHandle
+newtype Socket = Socket { sockIOCPHandle :: IOCPHandle }
     deriving Eq
+
+-- | Get the underlying file descriptor.
+sockFd :: Socket -> SOCKET
+sockFd = fromIntegral . ptrToWordPtr . iHANDLE . sockIOCPHandle
 
 -- Note: Functions that take a 'Socket' expect Winsock to already be initialized.
 
@@ -80,18 +83,18 @@ connect (Socket ih) addr = do
 shutdown :: Socket -> NS.ShutdownCmd -> IO ()
 shutdown sock how =
     Win32.failIf_ (/= 0) "shutdown" $
-    withSocket sock $ \s ->
-    c_shutdown s (sdownCmdToInt how)
+    c_shutdown (sockFd sock) (sdownCmdToInt how)
 
 sdownCmdToInt :: NS.ShutdownCmd -> CInt
 sdownCmdToInt NS.ShutdownReceive = #const SD_RECEIVE
 sdownCmdToInt NS.ShutdownSend    = #const SD_SEND
 sdownCmdToInt NS.ShutdownBoth    = #const SD_BOTH
 
+-- | Close a socket, to return socket resources to the system.
+--
+-- 'close' must not be called concurrently with another socket operation.
 close :: Socket -> IO ()
-close (Socket ih) =
-    Manager.closeWith ih $
-    Win32.failIf_ (/= 0) "close" . c_closesocket . castHANDLEToSOCKET
+close = Win32.failIf_ (/= 0) "close" . c_closesocket . sockFd
 
 recvBuf :: Socket -> Ptr a -> Int -> IO Int
 recvBuf (Socket ih) buf len =
@@ -126,14 +129,6 @@ send :: Socket -> ByteString -> IO Int
 send sock bs =
     unsafeUseAsCStringLen bs $ \(buf, len) ->
     sendBuf sock buf len
-
--- | Operate on the underlying file descriptor.  Throw an exception if the
--- socket has been closed.  This uses 'Manager.withHANDLE', so the same
--- caveats apply.
-withSocket :: Socket -> (SOCKET -> IO a) -> IO a
-withSocket (Socket iocp) cb =
-    Manager.withHANDLE iocp (cb . castHANDLEToSOCKET)
-        >>= maybe (fail "withSocket: socket closed") return
 
 newtype Winsock = Winsock (Ptr ())
 
