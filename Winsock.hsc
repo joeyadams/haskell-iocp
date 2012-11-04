@@ -4,7 +4,6 @@
 module Winsock (
     Socket(..),
     SOCKET,
-    sockFd,
     socket,
     connect,
     shutdown,
@@ -28,9 +27,9 @@ module Winsock (
 ## endif
 ##endif
 
-import IOCP.Manager             (IOCPHandle, iHANDLE, LPOVERLAPPED, withIOCP)
+import IOCP.Manager             (LPOVERLAPPED)
 import qualified IOCP.FFI     as FFI
-import qualified IOCP.Manager as Manager
+import qualified IOCP.Manager as Mgr
 
 import Control.Applicative      ((<$>))
 import Control.Monad            (void)
@@ -48,32 +47,39 @@ import System.Win32.Types
 import qualified Network.Socket     as NS
 import qualified System.Win32.Types as Win32
 
-newtype Socket = Socket { sockIOCPHandle :: IOCPHandle }
+newtype Socket = Socket { sockFd :: SOCKET }
     deriving Eq
-
--- | Get the underlying file descriptor.
-sockFd :: Socket -> SOCKET
-sockFd = fromIntegral . ptrToWordPtr . iHANDLE . sockIOCPHandle
 
 -- Note: Functions that take a 'Socket' expect Winsock to already be initialized.
 
 socket :: NS.Family -> NS.SocketType -> NS.ProtocolNumber -> IO Socket
 socket family stype protocol = do
     initWinsock
-    sockH <- wordPtrToPtr . fromIntegral . NS.fdSocket
-         <$> NS.socket family stype protocol
-    Just mgr <- Manager.getSystemManager
-    Socket <$> Manager.associate mgr sockH
+    fd <- fromIntegral . NS.fdSocket <$> NS.socket family stype protocol
+    mgr <- getManager
+    Mgr.registerHandle mgr (castSOCKETToHANDLE fd)
+    return (Socket fd)
+
+getManager :: IO Mgr.Manager
+getManager = Mgr.getSystemManager >>= maybe (fail "requires threaded RTS") return
+
+withOverlapped :: SOCKET -> Word64
+               -> (LPOVERLAPPED -> IO ())
+               -> Mgr.CompletionCallback a
+               -> IO a
+withOverlapped h offset startCB completionCB = do
+    mgr <- getManager
+    Mgr.withOverlapped mgr (castSOCKETToHANDLE h) offset startCB completionCB
 
 connect :: Socket -> NS.SockAddr -> IO ()
-connect (Socket ih) addr = do
+connect (Socket sock) addr = do
     winsock <- getWinsock
-    withIOCP ih 0 (startCB winsock) completionCB
+    withOverlapped sock 0 (startCB winsock) completionCB
   where
-    startCB winsock handle overlapped =
+    startCB winsock overlapped =
         withSockAddr addr $ \addr_ptr addr_len ->
         Win32.failIfFalse_ "connect" $
-        c_winsock_connect winsock (castHANDLEToSOCKET handle)
+        c_winsock_connect winsock sock
                           addr_ptr (fromIntegral addr_len)
                           overlapped
 
@@ -91,31 +97,32 @@ sdownCmdToInt NS.ShutdownReceive = #const SD_RECEIVE
 sdownCmdToInt NS.ShutdownSend    = #const SD_SEND
 sdownCmdToInt NS.ShutdownBoth    = #const SD_BOTH
 
--- | Close a socket, to return socket resources to the system.
---
--- 'close' must not be called concurrently with another socket operation.
 close :: Socket -> IO ()
-close = Win32.failIf_ (/= 0) "close" . c_closesocket . sockFd
+close (Socket sock) = do
+    mgr <- getManager
+    Mgr.closeHandleWith mgr (close' . castHANDLEToSOCKET) (castSOCKETToHANDLE sock)
+  where
+    close' = Win32.failIf_ (/= 0) "close" . c_closesocket
 
 recvBuf :: Socket -> Ptr a -> Int -> IO Int
-recvBuf (Socket ih) buf len =
-    withIOCP ih 0 startCB completionCB
+recvBuf (Socket sock) buf len =
+    withOverlapped sock 0 startCB completionCB
   where
-    startCB h ol =
+    startCB ol =
         Win32.failIfFalse_ "recv" $
-        c_winsock_recv (castHANDLEToSOCKET h) (castPtr buf) (fromIntegral len) ol
+        c_winsock_recv sock (castPtr buf) (fromIntegral len) ol
 
     completionCB err numBytes
         | err == 0  = return (fromIntegral numBytes)
         | otherwise = FFI.throwWinErr "recv" err
 
 sendBuf :: Socket -> Ptr a -> Int -> IO Int
-sendBuf (Socket ih) buf len =
-    withIOCP ih 0 startCB completionCB
+sendBuf (Socket sock) buf len =
+    withOverlapped sock 0 startCB completionCB
   where
-    startCB h ol =
+    startCB ol =
         Win32.failIfFalse_ "send" $
-        c_winsock_send (castHANDLEToSOCKET h) (castPtr buf) (fromIntegral len) ol
+        c_winsock_send sock (castPtr buf) (fromIntegral len) ol
 
     completionCB err numBytes
         | err == 0  = return (fromIntegral numBytes)
@@ -145,8 +152,8 @@ winsockRef = unsafePerformIO (c_winsock_init >>= newIORef)
 
 type SOCKET = #type SOCKET
 
--- castSOCKETToHANDLE :: SOCKET -> HANDLE
--- castSOCKETToHANDLE = wordPtrToPtr . fromIntegral
+castSOCKETToHANDLE :: SOCKET -> HANDLE
+castSOCKETToHANDLE = wordPtrToPtr . fromIntegral
 
 castHANDLEToSOCKET :: HANDLE -> SOCKET
 castHANDLEToSOCKET = fromIntegral . ptrToWordPtr

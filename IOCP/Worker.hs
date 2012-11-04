@@ -10,6 +10,7 @@ module IOCP.Worker (
 ) where
 
 import Control.Concurrent
+import Control.Exception    (mask_)
 import Control.Monad        (forever, void)
 import Data.IORef
 import GHC.IO               (unsafeUnmask)
@@ -39,14 +40,12 @@ new = do
 -- A job should not block for long or throw an exception, as this will prevent
 -- future jobs from running.
 --
--- Exception safety:  'enqueue' is atomic and non-interruptible, but only if
--- the caller uses 'Control.Exception.mask'.  @enqueue@ could easily do this by
--- itself, but it doesn't, to avoid a redundant 'Control.Exception.mask' call
--- when the caller has other things to do inside an exception mask.
+-- Exception safety:  atomic, non-interruptible
 enqueue :: Worker -> IO () -> IO ()
-enqueue Worker{..} io = do
-    !() <- atomicModifyIORef workerJobs $ \jobs -> (snocJobList jobs io, ())
-    void $ tryPutMVar workerWake ()
+enqueue Worker{..} io =
+    mask_ $ do
+        !() <- atomicModifyIORef workerJobs $ \jobs -> (snocJobList jobs io, ())
+        void $ tryPutMVar workerWake ()
 
 ------------------------------------------------------------------------
 -- Helpers
