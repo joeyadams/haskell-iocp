@@ -40,6 +40,9 @@ data Manager = Manager
     , managerThreadPool     :: WorkerList
     }
 
+instance Eq Manager where
+    (==) a b = managerHandles a == managerHandles b
+
 type ManagerCompletionPort = FFI.IOCP (CompletionCallback ())
 
 data HandleState = HandleState
@@ -76,8 +79,8 @@ managerRef = unsafePerformIO $
         else newIORef Nothing
 {-# NOINLINE managerRef #-}
 
--- | Nifty trick to allow each 'IOCPHandle' to allocate workers per concurrent
--- task, while allowing all 'IOCPHandles' to share the thread pool as a whole.
+-- | Nifty trick to allow each 'HandleState' to allocate workers per concurrent
+-- task, while allowing all 'HandleState's to share the thread pool as a whole.
 newThreadPool :: IO WorkerList
 newThreadPool = unsafeInterleaveIO $ do
     w  <- Worker.new
@@ -122,7 +125,7 @@ unregister Manager{..} key hstate = do
 
 -- | Close the 'HANDLE' and unregister it from the I/O manager.
 -- The callback is run in an exception 'mask', and should not use interruptible
--- operations (e.g. 'takeMVar', 'threadDelay').
+-- operations (e.g. 'takeMVar', 'threadDelay', 'System.IO.hClose').
 closeHandleWith :: Manager -> (HANDLE -> IO ()) -> HANDLE -> IO ()
 closeHandleWith Manager{..} close h =
     mask_ $ do
