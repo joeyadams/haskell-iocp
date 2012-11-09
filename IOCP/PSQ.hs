@@ -49,7 +49,7 @@
 -- Queues/, ICFP 2001, pp. 110-121
 --
 -- <http://citeseer.ist.psu.edu/hinze01simple.html>
-module GHC.Event.PSQ
+module IOCP.PSQ
     (
     -- * Binding Type
     Elem(..)
@@ -92,14 +92,14 @@ import Data.Maybe (Maybe(..))
 import GHC.Base
 import GHC.Num (Num(..))
 import GHC.Show (Show(showsPrec))
-import GHC.Event.Unique (Unique)
+import Data.Unique (Unique)
 
 -- | @E k p@ binds the key @k@ with the priority @p@.
 data Elem a = E
-    { key   :: {-# UNPACK #-} !Key
-    , prio  :: {-# UNPACK #-} !Prio
+    { key   :: !Key
+    , prio  :: !Prio
     , value :: a
-    } deriving (Eq, Show)
+    } deriving (Eq)
 
 ------------------------------------------------------------------------
 -- | A mapping from keys @k@ to priorites @p@.
@@ -108,10 +108,10 @@ type Prio = Double
 type Key = Unique
 
 data PSQ a = Void
-           | Winner {-# UNPACK #-} !(Elem a)
+           | Winner !(Elem a)
                     !(LTree a)
-                    {-# UNPACK #-} !Key  -- max key
-           deriving (Eq, Show)
+                    !Key  -- max key
+           deriving (Eq)
 
 -- | /O(1)/ The number of elements in a queue.
 size :: PSQ a -> Int
@@ -288,17 +288,17 @@ atMosts !pt q = case q of
 type Size = Int
 
 data LTree a = Start
-             | LLoser {-# UNPACK #-} !Size
-                      {-# UNPACK #-} !(Elem a)
+             | LLoser !Size
+                      !(Elem a)
                       !(LTree a)
-                      {-# UNPACK #-} !Key  -- split key
+                      !Key  -- split key
                       !(LTree a)
-             | RLoser {-# UNPACK #-} !Size
-                      {-# UNPACK #-} !(Elem a)
+             | RLoser !Size
+                      !(Elem a)
                       !(LTree a)
-                      {-# UNPACK #-} !Key  -- split key
+                      !Key  -- split key
                       !(LTree a)
-             deriving (Eq, Show)
+             deriving (Eq)
 
 size' :: LTree a -> Size
 size' Start              = 0
