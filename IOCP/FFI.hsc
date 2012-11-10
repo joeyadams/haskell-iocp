@@ -100,9 +100,9 @@ getNextCompletion iocp timeout =
             Win32.failWith "GetQueuedCompletionStatus" err
 
 foreign import WINDOWS_CCONV unsafe "windows.h PostQueuedCompletionStatus"
-    c_PostQueuedCompletionStatus :: IOCP a -> DWORD -> ULONG_PTR -> Overlapped a -> IO BOOL
+    c_PostQueuedCompletionStatus :: IOCP a -> DWORD -> ULONG_PTR -> Overlapped -> IO BOOL
 
-postCompletion :: IOCP a -> DWORD -> Overlapped a -> IO ()
+postCompletion :: IOCP a -> DWORD -> Overlapped -> IO ()
 postCompletion iocp numBytes ol =
     Win32.failIfFalse_ "PostQueuedCompletionStatus" $
     c_PostQueuedCompletionStatus iocp numBytes 0 ol
@@ -110,13 +110,12 @@ postCompletion iocp numBytes ol =
 ------------------------------------------------------------------------
 -- Overlapped
 
--- | Identifies an I/O operation, and delivers a value of type @a@
--- to the completion port.
-newtype Overlapped a = Overlapped (Ptr ())
+-- | Identifies an I/O operation
+newtype Overlapped = Overlapped (Ptr ())
     deriving (Eq, Ord, Show)
 
 foreign import ccall unsafe
-    c_iocp_new_overlapped :: Word64 -> StablePtr a -> IO (Overlapped a)
+    c_iocp_new_overlapped :: Word64 -> StablePtr a -> IO Overlapped
 
 -- | Allocate a new
 -- <http://msdn.microsoft.com/en-us/library/windows/desktop/ms684342%28v=vs.85%29.aspx OVERLAPPED>
@@ -124,19 +123,19 @@ foreign import ccall unsafe
 -- an @LPOVERLAPPED@, provided the @HANDLE@ was associated with an 'IOCP' with
 -- the same type @a@.
 newOverlapped :: Word64 -- ^ Offset/OffsetHigh
-              -> a      -- ^ Application context (stored outside the @OVERLAPPED@ structure)
-              -> IO (Overlapped a)
+              -> a      -- ^ Application context (stored alongside the @OVERLAPPED@ structure)
+              -> IO Overlapped
 newOverlapped offset ctx = do
     ptr <- newStablePtr ctx
     Win32.failIf (== Overlapped nullPtr) "newOverlapped" $
         c_iocp_new_overlapped offset ptr
 
 foreign import ccall unsafe
-    c_iocp_finish_overlapped :: Overlapped a -> IO (StablePtr a)
+    c_iocp_finish_overlapped :: Overlapped -> IO (StablePtr a)
 
 -- | Discard an 'Overlapped' object.  This should be called if and only if
 -- no pending I/O was produced after all.
-discardOverlapped :: Overlapped a -> IO ()
+discardOverlapped :: Overlapped -> IO ()
 discardOverlapped o = c_iocp_finish_overlapped o >>= freeStablePtr
 
 ------------------------------------------------------------------------
