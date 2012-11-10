@@ -20,6 +20,7 @@ source-repository head
 
 library
     exposed-modules:
+        IOCP.Clock
         IOCP.FFI
         IOCP.Manager
         IOCP.PSQ
