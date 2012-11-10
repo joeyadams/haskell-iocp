@@ -110,7 +110,8 @@ postCompletion iocp numBytes ol =
 ------------------------------------------------------------------------
 -- Overlapped
 
--- | Identifies an I/O operation
+-- | Identifies an I/O operation.  Used as the @LPOVERLAPPED@ parameter
+-- for overlapped I/O functions (e.g. @ReadFile@, @WSASend@).
 newtype Overlapped = Overlapped (Ptr ())
     deriving (Eq, Ord, Show)
 

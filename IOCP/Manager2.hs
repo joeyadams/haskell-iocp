@@ -1,20 +1,19 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DoAndIfThenElse #-}
+{-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE RecordWildCards #-}
 module IOCP.Manager2 (
     -- * Manager
     Manager,
     new,
+    getSystemManager,
 
-    -- * Overlapped
-    Overlapped(..),
+    -- * Overlapped I/O
+    associateHandle,
+    withOverlapped,
+    StartCallback,
     CompletionCallback,
-    newOverlapped,
-    discardOverlapped,
-
-    -- * Posting to the completion port
-    postOverlapped,
-    postIO,
+    Overlapped(..),
 
     -- * Timeouts
     TimeoutCallback,
@@ -27,17 +26,29 @@ module IOCP.Manager2 (
 
 import IOCP.Clock   (Clock, Seconds, getClock, getTime)
 import IOCP.FFI     (Overlapped(..))
-import IOCP.Worker  (forkOSUnmasked)
-import qualified IOCP.FFI as FFI
-import qualified IOCP.PSQ as Q
+import IOCP.Worker  (Worker, forkOSUnmasked)
+import qualified IOCP.FFI    as FFI
+import qualified IOCP.PSQ    as Q
+import qualified IOCP.Worker as Worker
 
+import Control.Concurrent
+import Control.Exception as E
+import Control.Monad
+import Data.IORef
 import Data.Word
 import Data.Unique
+import Debug.Trace          (traceIO)
+import Foreign.Ptr
+import System.IO.Unsafe     (unsafeInterleaveIO, unsafePerformIO)
 import System.Win32.Types
 
+import qualified Data.IntMap as IM
+
 data Manager = Manager
-    { mgrIOCP  :: !(FFI.IOCP ManagerCallback)
-    , mgrClock :: !Clock
+    { mgrIOCP      :: !(FFI.IOCP ManagerCallback)
+    , mgrClock     :: !Clock
+    , mgrWorkers   :: WorkerList
+    , mgrWorkerMap :: !(IORef WorkerMap)
     }
 
 type ManagerCallback = ErrCode -> DWORD -> Mgr ()
@@ -57,26 +68,25 @@ newtype TimeoutKey = TK Unique
 
 new :: IO Manager
 new = do
-    mgrIOCP  <- FFI.newIOCP
-    mgrClock <- getClock
+    mgrIOCP      <- FFI.newIOCP
+    mgrClock     <- getClock
+    mgrWorkers   <- newWorkerList
+    mgrWorkerMap <- newIORef IM.empty
     let mgr = Manager{..}
     _tid <- forkOSUnmasked $ loop mgr
     return mgr
 
--- | Callback (called from the I/O manager) when the completion is delivered.
-type CompletionCallback = ErrCode   -- ^ 0 indicates success
-                       -> DWORD     -- ^ Number of bytes transferred
-                       -> IO ()
+getSystemManager :: IO (Maybe Manager)
+getSystemManager = readIORef managerRef
 
-newOverlapped :: Word64 -- ^ Offset/OffsetHigh
-              -> CompletionCallback
-              -> IO Overlapped
-newOverlapped offset cb = newOverlappedEx offset (liftCompletionCallback cb)
+managerRef :: IORef (Maybe Manager)
+managerRef = unsafePerformIO $
+    if rtsSupportsBoundThreads
+        then new >>= newIORef . Just
+        else newIORef Nothing
+{-# NOINLINE managerRef #-}
 
-liftCompletionCallback :: CompletionCallback -> ManagerCallback
-liftCompletionCallback cb = \errCode numBytes -> liftIO $ cb errCode numBytes
-
--- | Internal variant of 'newOverlapped' that allows the callback to modify the
+-- | Variant of 'newOverlapped' that allows the callback to modify the
 -- timeout queue.
 newOverlappedEx :: Word64 -> ManagerCallback -> IO Overlapped
 newOverlappedEx = FFI.newOverlapped
@@ -87,14 +97,15 @@ discardOverlapped = FFI.discardOverlapped
 postOverlapped :: Manager -> Overlapped -> IO ()
 postOverlapped mgr = FFI.postCompletion (mgrIOCP mgr) 0
 
+-- | Queue an action to be performed by the I/O manager thread.
+postIO :: Manager -> IO () -> IO ()
+postIO mgr = postMgr mgr . liftIO
+
+-- | Variant of 'postIO' that allows the callback to modify the
+-- timeout queue.
 postMgr :: Manager -> Mgr () -> IO ()
 postMgr mgr cb =
     newOverlappedEx 0 (\_errCode _numBytes -> cb) >>= postOverlapped mgr
-
--- | Queue an action to be performed by the I/O manager thread.
-postIO :: Manager -> IO () -> IO ()
-postIO mgr io =
-    newOverlappedEx 0 (\_errCode _numBytes -> liftIO io) >>= postOverlapped mgr
 
 -- | Register an action to be performed in the given number of seconds.  The
 -- returned 'TimeoutKey' can be used to later unregister or update the timeout.
@@ -196,3 +207,162 @@ step mgr@Manager{..} = do
 loop :: Manager -> IO loop
 loop mgr = go Q.empty
   where go s = runMgr (step mgr) s >>= go . snd
+
+------------------------------------------------------------------------
+-- Overlapped I/O
+
+-- | Associate a 'HANDLE' with the I/O manager's completion port.  This must be
+-- done before using the handle with 'withOverlapped'.
+associateHandle :: Manager -> HANDLE -> IO ()
+associateHandle Manager{..} h =
+    FFI.associateHandleWithIOCP mgrIOCP h
+
+-- | Callback that starts the overlapped I/O operation.
+-- It must return successfully if and only if an I/O completion has been
+-- queued.  Otherwise, it must throw an exception, which 'withOverlapped'
+-- will rethrow.
+type StartCallback = Overlapped -> IO ()
+
+-- | Called when the completion is delivered.
+type CompletionCallback a = ErrCode   -- ^ 0 indicates success
+                         -> DWORD     -- ^ Number of bytes transferred
+                         -> IO a
+
+newOverlapped :: Word64 -- ^ Offset/OffsetHigh
+              -> CompletionCallback ()
+              -> IO Overlapped
+newOverlapped offset cb =
+    newOverlappedEx offset $ \errCode numBytes -> liftIO $ cb errCode numBytes
+
+-- | Start an overlapped I/O operation, and wait for its completion.  If
+-- 'withOverlapped' is interrupted by an asynchronous exception, the operation
+-- will be canceled using @CancelIo@.
+--
+-- 'withOverlapped' waits for a completion to arrive before returning or
+-- throwing an exception.  This means you can use functions like
+-- 'Foreign.Marshal.Alloc.alloca' to allocate buffers for the operation.
+withOverlapped :: Manager
+               -> HANDLE
+               -> Word64 -- ^ Value to use for the @OVERLAPPED@
+                         --   structure's Offset/OffsetHigh members.
+               -> StartCallback
+               -> CompletionCallback a
+               -> IO a
+withOverlapped mgr h offset startCB completionCB = do
+    signal <- newEmptyMVar
+    let signalReturn a = void $ tryPutMVar signal $ return a
+        signalThrow ex = void $ tryPutMVar signal $ throwIO (ex :: SomeException)
+
+    mask_ $ withWorker mgr h $ \enqueue -> do
+        enqueue $ do
+            let completionCB' :: CompletionCallback ()
+                completionCB' e b =
+                    (completionCB e b >>= signalReturn) `E.catch` signalThrow
+
+            e <- try $ newOverlapped offset completionCB'
+            case e of
+                Left ex -> signalThrow ex
+                Right ol ->
+                    startCB ol `E.catch` \ex -> do
+                        discardOverlapped ol
+                        signalThrow ex
+
+        let cancel = uninterruptibleMask_ $ do
+                cancelDone <- newEmptyMVar
+                enqueue $ do
+                    FFI.cancelIo h `E.catch` \ex -> do
+                        traceIO $ "CancelIo failed: " ++ show (ex :: SomeException)
+                        signalThrow ex
+                    putMVar cancelDone ()
+                _ <- takeMVar signal
+                takeMVar cancelDone
+
+        join (takeMVar signal `onException` cancel)
+
+------------------------------------------------------------------------
+-- Worker allocation
+
+type WorkerMap = IM.IntMap Pool
+
+-- | Used to allocate worker threads for I/O requests.  The rule is: a handle
+-- may not use the same worker for two simultaneous operations (however,
+-- multiple handles may share the same worker).  This is because CancelIo
+-- cancels all pending I/O for a given handle in the current thread.
+-- CancelIoEx would let us specify an individual operation to cancel,
+-- but it was introduced in Windows Vista.
+--
+-- Whenever we can, we queue jobs to the completion handler using
+-- 'postIO'.  This is about 30% faster than using a separate
+-- worker thread, as it avoids a context switch.
+data Pool = Pool
+    { pCompletionPort :: !Bool
+    , pWorkers        :: WorkerList
+    , pRefCount       :: !Int
+        -- ^ Number of in-progress 'withWorker' calls.  When this drops to
+        --   zero, we can remove this entry from the 'WorkerMap'.
+    }
+
+data WorkerList = WL !Worker WorkerList
+
+-- | Nifty trick to allow each 'Pool' to allocate workers per concurrent
+-- operation, while allowing 'Pool's to share workers.
+newWorkerList :: IO WorkerList
+newWorkerList = unsafeInterleaveIO $ do
+    w  <- Worker.new
+    ws <- newWorkerList
+    return (WL w ws)
+{-# NOINLINE newWorkerList #-}
+
+type Enqueue = IO () -> IO ()
+
+type ReleaseF = WorkerMap -> (WorkerMap, ())
+
+withWorker :: Manager -> HANDLE -> (Enqueue -> IO a) -> IO a
+withWorker mgr@Manager{..} h cb =
+    mask $ \restore -> do
+        (enqueue, releaseF) <- atomicModifyIORef mgrWorkerMap grabF
+        let release = atomicModifyIORef mgrWorkerMap releaseF
+                  >>= evaluate
+        a <- restore (cb enqueue) `onException` release
+        release
+        return a
+  where
+    key = (fromIntegral . ptrToIntPtr) h :: Int
+
+    grabF :: WorkerMap -> (WorkerMap, (Enqueue, ReleaseF))
+    grabF m =
+        case IM.lookup key m of
+            Nothing ->
+                let !pool = Pool False mgrWorkers 1
+                    !m'   = IM.insert key pool m
+                 in (m', (postIO mgr, releaseCP))
+            Just Pool{..}
+              | pCompletionPort ->
+                let !pool = Pool False pWorkers (pRefCount + 1)
+                    !m'   = IM.insert key pool m
+                 in (m', (postIO mgr, releaseCP))
+              | WL w ws <- pWorkers ->
+                let !pool = Pool pCompletionPort ws (pRefCount + 1)
+                    !m'   = IM.insert key pool m
+                 in (m', (Worker.enqueue w, releaseWorker w))
+
+    releaseCP :: ReleaseF
+    releaseCP = releaseWith $ \Pool{..} ->
+        Pool True pWorkers (pRefCount - 1)
+
+    releaseWorker :: Worker -> ReleaseF
+    releaseWorker w = releaseWith $ \Pool{..} ->
+        Pool pCompletionPort (WL w pWorkers) (pRefCount - 1)
+
+    releaseWith :: (Pool -> Pool) -> ReleaseF
+    releaseWith f m =
+        case IM.lookup key m of
+            Nothing -> (m, ())  -- should never happen
+            Just pool
+              | pRefCount pool <= 1 ->
+                let !m' = IM.delete key m
+                 in (m', ())
+              | otherwise ->
+                let !pool' = f pool
+                    !m'    = IM.insert key pool' m
+                 in (m', ())
