@@ -18,9 +18,6 @@ module IOCP.FFI (
     cancelIo,
 
     -- * Monotonic time
-    -- | Windows has multiple monotonic time APIs, each with its own caveats.
-    -- It seems that QueryPerformanceCounter has higher precision,
-    -- while GetTickCount(64) has better accuracy and consistency.
 
     -- ** GetTickCount
     getTickCount,
@@ -227,8 +224,6 @@ callQP qpfunc =
 --
 --  * On a multiprocessor computer, may produce different results on
 --    different processors due to hardware bugs.
---
---  * May drift when the computer is put to sleep.
 --
 -- To get a monotonic time in seconds, divide the result of
 -- 'queryPerformanceCounter' by that of 'queryPerformanceFrequency'.
