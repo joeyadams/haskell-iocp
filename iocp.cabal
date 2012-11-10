@@ -27,6 +27,7 @@ library
         Winsock
 
     c-sources:
+        cbits/dynamic.c
         cbits/iocp.c
         cbits/Winsock.c
 
