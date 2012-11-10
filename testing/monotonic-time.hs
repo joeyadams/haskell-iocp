@@ -29,7 +29,7 @@ main = do
             t64 <- maybe (return Nothing) (fmap Just) gtc64
             qpc <- case freq of
                 Nothing -> return Nothing
-                Just f  -> fmap (\c -> (c, f)) <$> queryPerformanceCounter
+                Just f  -> (\c -> Just (c, f)) <$> queryPerformanceCounter
             putStrLn $ formatTimes t t64 qpc
 
         formatTimes t t64 qpc =

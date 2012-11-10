@@ -222,6 +222,9 @@ callQP qpfunc =
 --
 -- Problems:
 --
+--  * Might not be available on some hardware.  Use 'queryPerformanceFrequency'
+--    to test for availability before calling this function.
+--
 --  * On a multiprocessor computer, may produce different results on
 --    different processors due to hardware bugs.
 --
@@ -229,8 +232,10 @@ callQP qpfunc =
 -- 'queryPerformanceCounter' by that of 'queryPerformanceFrequency'.
 --
 -- <http://msdn.microsoft.com/en-us/library/windows/desktop/ms644904%28v=vs.85%29.aspx>
-queryPerformanceCounter :: IO (Maybe Int64)
-queryPerformanceCounter = callQP c_QueryPerformanceCounter
+queryPerformanceCounter :: IO Int64
+queryPerformanceCounter =
+    callQP c_QueryPerformanceCounter
+    >>= maybe (Win32.errorWin "QueryPerformanceCounter") return
 
 -- | Call the @QueryPerformanceFrequency@ function.  Return 'Nothing' if the
 -- hardware does not provide a high-resolution performance counter.
