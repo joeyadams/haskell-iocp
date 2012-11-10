@@ -23,6 +23,7 @@ library
         IOCP.Clock
         IOCP.FFI
         IOCP.Manager
+        IOCP.Manager2
         IOCP.PSQ
         IOCP.Worker
         Winsock
