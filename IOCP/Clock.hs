@@ -20,10 +20,9 @@ import Data.Word    (Word32, Word64)
 -- | Monotonic clock
 newtype Clock = Clock (IO Seconds)
 
--- | Absolute time, in seconds since some fixed time in the past
 type Seconds = Double
 
--- | Get the current time.
+-- | Get the current time, in seconds since some fixed time in the past.
 getTime :: Clock -> IO Seconds
 getTime (Clock io) = io
 
