@@ -27,9 +27,9 @@ module Winsock (
 ## endif
 ##endif
 
-import IOCP.Manager             (LPOVERLAPPED)
-import qualified IOCP.FFI     as FFI
-import qualified IOCP.Manager as Mgr
+import IOCP.Manager2            (Overlapped(..))
+import qualified IOCP.FFI      as FFI
+import qualified IOCP.Manager2 as Mgr
 
 import Control.Applicative      ((<$>))
 import Control.Monad            (void)
@@ -57,14 +57,14 @@ socket family stype protocol = do
     initWinsock
     fd <- fromIntegral . NS.fdSocket <$> NS.socket family stype protocol
     mgr <- getManager
-    Mgr.registerHandle mgr (castSOCKETToHANDLE fd)
+    Mgr.associateHandle mgr (castSOCKETToHANDLE fd)
     return (Socket fd)
 
 getManager :: IO Mgr.Manager
 getManager = Mgr.getSystemManager >>= maybe (fail "requires threaded RTS") return
 
 withOverlapped :: SOCKET -> Word64
-               -> (LPOVERLAPPED -> IO ())
+               -> (Overlapped -> IO ())
                -> Mgr.CompletionCallback a
                -> IO a
 withOverlapped h offset startCB completionCB = do
@@ -98,11 +98,7 @@ sdownCmdToInt NS.ShutdownSend    = #const SD_SEND
 sdownCmdToInt NS.ShutdownBoth    = #const SD_BOTH
 
 close :: Socket -> IO ()
-close (Socket sock) = do
-    mgr <- getManager
-    Mgr.closeHandleWith mgr (close' . castHANDLEToSOCKET) (castSOCKETToHANDLE sock)
-  where
-    close' = Win32.failIf_ (/= 0) "close" . c_closesocket
+close = Win32.failIf_ (/= 0) "close" . c_closesocket . sockFd
 
 recvBuf :: Socket -> Ptr a -> Int -> IO Int
 recvBuf (Socket sock) buf len =
@@ -155,14 +151,11 @@ type SOCKET = #type SOCKET
 castSOCKETToHANDLE :: SOCKET -> HANDLE
 castSOCKETToHANDLE = wordPtrToPtr . fromIntegral
 
-castHANDLEToSOCKET :: HANDLE -> SOCKET
-castHANDLEToSOCKET = fromIntegral . ptrToWordPtr
-
 foreign import ccall unsafe
     c_winsock_init :: IO Winsock
 
 foreign import ccall unsafe
-    c_winsock_connect :: Winsock -> SOCKET -> Ptr NS.SockAddr -> CInt -> LPOVERLAPPED -> IO BOOL
+    c_winsock_connect :: Winsock -> SOCKET -> Ptr NS.SockAddr -> CInt -> Overlapped -> IO BOOL
 
 foreign import WINDOWS_CCONV safe "winsock2.h shutdown"
     c_shutdown :: SOCKET -> CInt -> IO CInt
@@ -171,7 +164,7 @@ foreign import WINDOWS_CCONV safe "winsock2.h closesocket"
     c_closesocket :: SOCKET -> IO CInt
 
 foreign import ccall unsafe
-    c_winsock_recv :: SOCKET -> Ptr CChar -> #{type u_long} -> LPOVERLAPPED -> IO BOOL
+    c_winsock_recv :: SOCKET -> Ptr CChar -> #{type u_long} -> Overlapped -> IO BOOL
 
 foreign import ccall unsafe
-    c_winsock_send :: SOCKET -> Ptr CChar -> #{type u_long} -> LPOVERLAPPED -> IO BOOL
+    c_winsock_send :: SOCKET -> Ptr CChar -> #{type u_long} -> Overlapped -> IO BOOL
