@@ -27,9 +27,9 @@ module Winsock (
 ## endif
 ##endif
 
-import IOCP.Manager2            (Overlapped(..))
-import qualified IOCP.FFI      as FFI
-import qualified IOCP.Manager2 as Mgr
+import IOCP.Manager             (Overlapped(..))
+import qualified IOCP.FFI     as FFI
+import qualified IOCP.Manager as Mgr
 
 import Control.Applicative      ((<$>))
 import Control.Monad            (void)

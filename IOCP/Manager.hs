@@ -1,4 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DoAndIfThenElse #-}
+{-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE RecordWildCards #-}
 module IOCP.Manager (
     -- * Manager
@@ -6,68 +8,73 @@ module IOCP.Manager (
     new,
     getSystemManager,
 
-    -- * Handle registration
-    registerHandle,
-    closeHandleWith,
-
-    -- * Performing overlapped I/O
+    -- * Overlapped I/O
+    associateHandle,
     withOverlapped,
     StartCallback,
     CompletionCallback,
-    LPOVERLAPPED,
+    Overlapped(..),
+
+    -- * Timeouts
+    TimeoutCallback,
+    TimeoutKey,
+    Seconds,
+    registerTimeout,
+    updateTimeout,
+    unregisterTimeout,
 ) where
 
-import IOCP.Worker (Worker, forkOSUnmasked)
+import IOCP.Clock   (Clock, Seconds, getClock, getTime)
+import IOCP.FFI     (Overlapped(..))
+import IOCP.Worker  (Worker, forkOSUnmasked)
 import qualified IOCP.FFI    as FFI
+import qualified IOCP.PSQ    as Q
 import qualified IOCP.Worker as Worker
 
 import Control.Concurrent
 import Control.Exception as E
-import Control.Monad        (forever, join, void, when)
+import Control.Monad
 import Data.IORef
-import Data.Word            (Word64)
+import Data.Word
+import Data.Unique
 import Debug.Trace          (traceIO)
-import Foreign.Ptr          (Ptr, ptrToIntPtr)
-import GHC.Windows          (iNFINITE)
+import Foreign.Ptr
 import System.IO.Unsafe     (unsafeInterleaveIO, unsafePerformIO)
-import System.Win32.Types   (DWORD, ErrCode, HANDLE)
+import System.Win32.Types
 
 import qualified Data.IntMap as IM
 
 data Manager = Manager
-    { managerCompletionPort :: !ManagerCompletionPort
-    , managerHandles        :: !(IORef (IM.IntMap HandleState))
-    , managerThreadPool     :: WorkerList
+    { mgrIOCP      :: !(FFI.IOCP ManagerCallback)
+    , mgrClock     :: !Clock
+    , mgrWorkers   :: WorkerList
+    , mgrWorkerMap :: !(IORef WorkerMap)
     }
 
-instance Eq Manager where
-    (==) a b = managerHandles a == managerHandles b
+type ManagerCallback = ErrCode -> DWORD -> Mgr ()
 
-type ManagerCompletionPort = FFI.IOCP (CompletionCallback ())
+type TimeoutQueue = Q.PSQ TimeoutCallback
 
-data HandleState = HandleState
-    { hsPool    :: !(IORef PoolState)
-    , hsClosed  :: !(MVar Bool)
-    }
+-- |
+-- Warning: since the 'TimeoutCallback' is called from the I/O manager, it must
+-- not throw an exception or block for a long period of time.  In particular,
+-- be wary of 'Control.Exception.throwTo' and 'Control.Concurrent.killThread':
+-- if the target thread is making a foreign call, these functions will block
+-- until the call completes.
+type TimeoutCallback = IO ()
 
-instance Eq HandleState where
-    (==) a b = hsPool a == hsPool b
-
-data WorkerList = WL !Worker WorkerList
+newtype TimeoutKey = TK Unique
+    deriving (Eq, Ord)
 
 new :: IO Manager
 new = do
-    managerCompletionPort <- FFI.newIOCP
-    managerHandles        <- newIORef IM.empty
-    managerThreadPool     <- newThreadPool
-    _tid <- forkOSUnmasked $ forever $ do
-        m <- FFI.getNextCompletion managerCompletionPort iNFINITE
-        case m of
-            Nothing ->
-                fail "getNextCompletion unexpectedly timed out"
-            Just (cb, numBytes, errCode) ->
-                cb errCode numBytes
-    return Manager{..}
+    mgrIOCP      <- FFI.newIOCP
+    mgrClock     <- getClock
+    mgrWorkers   <- newWorkerList
+    mgrWorkerMap <- newIORef IM.empty
+    let mgr = Manager{..}
+    _tid <- forkOSUnmasked $ loop mgr
+    return mgr
 
 getSystemManager :: IO (Maybe Manager)
 getSystemManager = readIORef managerRef
@@ -79,128 +86,153 @@ managerRef = unsafePerformIO $
         else newIORef Nothing
 {-# NOINLINE managerRef #-}
 
--- | Nifty trick to allow each 'HandleState' to allocate workers per concurrent
--- task, while allowing all 'HandleState's to share the thread pool as a whole.
-newThreadPool :: IO WorkerList
-newThreadPool = unsafeInterleaveIO $ do
-    w  <- Worker.new
-    ws <- newThreadPool
-    return (WL w ws)
-{-# NOINLINE newThreadPool #-}
+-- | Variant of 'newOverlapped' that allows the callback to modify the
+-- timeout queue.
+newOverlappedEx :: Word64 -> ManagerCallback -> IO Overlapped
+newOverlappedEx = FFI.newOverlapped
 
-handleToInt :: HANDLE -> Int
-handleToInt = fromIntegral . ptrToIntPtr
+discardOverlapped :: Overlapped -> IO ()
+discardOverlapped = FFI.discardOverlapped
 
--- | Register a 'HANDLE' with the I/O manager.  This must be done before using
--- the handle with 'withOverlapped'.
+postOverlapped :: Manager -> Overlapped -> IO ()
+postOverlapped mgr = FFI.postCompletion (mgrIOCP mgr) 0
+
+-- | Queue an action to be performed by the I/O manager thread.
+postIO :: Manager -> IO () -> IO ()
+postIO mgr = postMgr mgr . liftIO
+
+-- | Variant of 'postIO' that allows the callback to modify the
+-- timeout queue.
+postMgr :: Manager -> Mgr () -> IO ()
+postMgr mgr cb =
+    newOverlappedEx 0 (\_errCode _numBytes -> cb) >>= postOverlapped mgr
+
+-- | Register an action to be performed in the given number of seconds.  The
+-- returned 'TimeoutKey' can be used to later unregister or update the timeout.
+-- The timeout is automatically unregistered when it fires.
 --
--- To close the handle, you must use 'closeHandleWith'.
-registerHandle :: Manager -> HANDLE -> IO ()
-registerHandle mgr@Manager{..} h = do
-    hstate <- do
-        hsPool   <- newIORef $ PoolState True managerThreadPool
-        hsClosed <- newMVar False
-        return HandleState{..}
-    mask_ $ join $ atomicModifyIORef managerHandles $ \m ->
-        case IM.lookup key m of
-            Nothing -> let !m' = IM.insert key hstate m
-                        in (m', associate `onException` unregister mgr key hstate)
-            Just _ -> (m, fail "IOCP.Manager.registerHandle: handle already registered")
-  where
-    key = handleToInt h
-    associate = FFI.associateHandleWithIOCP managerCompletionPort h
+-- The 'TimeoutCallback' will not be called more than once.
+registerTimeout :: Manager -> Seconds -> TimeoutCallback -> IO TimeoutKey
+registerTimeout mgr relTime cb = do
+    key <- newUnique
+    now <- getTime (mgrClock mgr)
+    let !expTime = now + relTime
+    postMgr mgr $ modifyTQ $ Q.insert key expTime cb
+    return $ TK key
 
--- | Remove an entry from managerHandles.  Guard against a potential race
--- condition where, after one HANDLE is closed, another one is created with the
--- same address.
-unregister :: Manager -> Int -> HandleState -> IO ()
-unregister Manager{..} key hstate = do
-    !() <- atomicModifyIORef managerHandles $ \m ->
-        case IM.lookup key m of
-            Just hstate' | hstate == hstate' ->
-                let !m' = IM.delete key m
-                 in (m', ())
-            _ -> (m, ())
-    return ()
+-- | Update an active timeout to fire in the given number of seconds (from the
+-- time 'updateTimeout' is called), instead of when it was going to fire.
+-- This has no effect if the timeout has already fired.
+updateTimeout :: Manager -> TimeoutKey -> Seconds -> IO ()
+updateTimeout mgr (TK key) relTime = do
+    now <- getTime (mgrClock mgr)
+    let !expTime = now + relTime
+    postMgr mgr $ modifyTQ $ Q.adjust (const expTime) key
 
--- | Close the 'HANDLE' and unregister it from the I/O manager.
--- The callback is run in an exception 'mask', and should not use interruptible
--- operations (e.g. 'takeMVar', 'threadDelay', 'System.IO.hClose').
-closeHandleWith :: Manager -> (HANDLE -> IO ()) -> HANDLE -> IO ()
-closeHandleWith Manager{..} close h =
-    mask_ $ do
-        HandleState{..} <-
-            join $ atomicModifyIORef managerHandles $ \m ->
-            case IM.lookup key m of
-                Nothing     -> (m, failNotRegistered)
-                Just hstate -> let !m' = IM.delete key m
-                                in (m', return hstate)
-        closed <- takeMVar hsClosed
-        -- closed should be False
-        close h `onException` putMVar hsClosed closed
-        putMVar hsClosed True
-  where
-    key = handleToInt h
-    failNotRegistered = fail "IOCP.Manager.closeHandleWith: handle already closed, or not registered"
-
--- | Used to allocate worker threads for I/O requests.  The rule is: a handle
--- may not use the same worker for two simultaneous operations (however,
--- multiple handles may share the same worker).  This is because CancelIo
--- cancels all pending I/O for a given handle in the current thread.
--- CancelIoEx lets us specify an individual operation to cancel, but it was
--- introduced in Windows Vista.
+-- | Unregister an active timeout.  This is a harmless no-op if the timeout is
+-- already unregistered or has already fired.
 --
--- Whenever we can, we queue jobs to the completion handler using
--- PostQueuedCompletionStatus.  This is about 30% faster than using a separate
--- worker thread, as it avoids a context switch.
-data PoolState = PoolState
-    { pCompletionPort :: !Bool
-    , pWorkers        :: WorkerList
-    }
+-- Warning: the timeout callback may fire even after
+-- 'unregisterTimeout' completes.
+unregisterTimeout :: Manager -> TimeoutKey -> IO ()
+unregisterTimeout mgr (TK key) =
+    postMgr mgr $ modifyTQ $ Q.delete key
 
-withWorkerAndMask :: Manager -> IORef PoolState -> ((IO () -> IO ()) -> IO a) -> IO a
-withWorkerAndMask mgr =
-    withIORefAndMask grab
-  where
-    grab ps@PoolState{..} =
-        if pCompletionPort then
-            (ps{pCompletionPort = False}, (releaseCP, postWorkToCP mgr))
-        else
-            case pWorkers of
-                WL w ws -> (ps{pWorkers = ws}, (releaseWorker w, Worker.enqueue w))
+------------------------------------------------------------------------
+-- The Mgr state monad
 
-    releaseCP       ps = ps{pCompletionPort = True}
-    releaseWorker w ps = ps{pWorkers = WL w (pWorkers ps)}
+newtype Mgr a = Mgr { runMgr :: TimeoutQueue -> IO (a, TimeoutQueue) }
 
-withIORefAndMask :: (s -> (s, (s -> s, a))) -> IORef s -> (a -> IO b) -> IO b
-withIORefAndMask grabF ref cb =
-    mask_ $ do
-        (releaseF, a) <- atomicModifyIORef ref grabF
-        let release = atomicModifyIORef ref (\s -> (releaseF s, ()))
-        b <- cb a `onException` release
-        release
-        return b
+instance Monad Mgr where
+    return a = Mgr $ \s -> return (a, s)
+    m >>= k = Mgr $ \s -> do
+        (a, s') <- runMgr m s
+        runMgr (k a) s'
 
-postWorkToCP :: Manager -> IO () -> IO ()
-postWorkToCP Manager{..} io =
-    FFI.newOverlapped 0 completionCB >>= FFI.postCompletion managerCompletionPort 0
-  where
-    completionCB :: CompletionCallback ()
-    completionCB _errCode _numBytes = io
+liftIO :: IO a -> Mgr a
+liftIO io = Mgr $ \s -> do
+    a <- io
+    return (a, s)
 
-type LPOVERLAPPED = Ptr ()
+getsTQ :: (TimeoutQueue -> a) -> Mgr a
+getsTQ f = Mgr $ \s -> return (f s, s)
+
+modifyTQ :: (TimeoutQueue -> TimeoutQueue) -> Mgr ()
+modifyTQ f = Mgr $ \s -> do
+    let !s' = f s
+    return ((), s')
+
+stateTQ :: (TimeoutQueue -> (a, TimeoutQueue)) -> Mgr a
+stateTQ f = Mgr $ \s -> do
+    let (a, !s') = f s
+    return (a, s')
+
+------------------------------------------------------------------------
+-- I/O manager loop
+
+-- | Call all expired timeouts, and return how much time until the next expiration.
+runExpiredTimeouts :: Manager -> Mgr (Maybe Seconds)
+runExpiredTimeouts Manager{..} = do
+    empty <- getsTQ Q.null
+    if empty then
+        return Nothing
+    else do
+        now <- liftIO $ getTime mgrClock
+        stateTQ (Q.atMost now) >>= mapM_ (liftIO . Q.value)
+        next <- getsTQ $ fmap Q.prio . Q.findMin
+        case next of
+            Nothing ->
+                return Nothing
+            Just t -> do
+                -- This value will always be positive since the call
+                -- to 'atMost' above removed any timeouts <= 'now'
+                let !t' = t - now
+                return $ Just t'
+
+-- | Return the delay argument to pass to GetQueuedCompletionStatus.
+fromTimeout :: Maybe Seconds -> Word32
+fromTimeout Nothing                 = 120000
+fromTimeout (Just sec) | sec > 120  = 120000
+                       | sec > 0    = ceiling (sec * 1000)
+                       | otherwise  = 0
+
+step :: Manager -> Mgr ()
+step mgr@Manager{..} = do
+    delay <- runExpiredTimeouts mgr
+    m <- liftIO $ FFI.getNextCompletion mgrIOCP (fromTimeout delay)
+    case m of
+        Nothing                      -> return ()
+        Just (cb, numBytes, errCode) -> cb errCode numBytes
+
+loop :: Manager -> IO loop
+loop mgr = go Q.empty
+  where go s = runMgr (step mgr) s >>= go . snd
+
+------------------------------------------------------------------------
+-- Overlapped I/O
+
+-- | Associate a 'HANDLE' with the I/O manager's completion port.  This must be
+-- done before using the handle with 'withOverlapped'.
+associateHandle :: Manager -> HANDLE -> IO ()
+associateHandle Manager{..} h =
+    FFI.associateHandleWithIOCP mgrIOCP h
 
 -- | Callback that starts the overlapped I/O operation.
 -- It must return successfully if and only if an I/O completion has been
--- queued.  Otherwise, it must throw an exception.  This exception will be
--- rethrown by 'withOverlapped'.
-type StartCallback = LPOVERLAPPED -> IO ()
+-- queued.  Otherwise, it must throw an exception, which 'withOverlapped'
+-- will rethrow.
+type StartCallback = Overlapped -> IO ()
 
--- | Callback (called from the I/O manager) for translating a completion.
--- Any exception it throws will be rethrown by 'withOverlapped'.
+-- | Called when the completion is delivered.
 type CompletionCallback a = ErrCode   -- ^ 0 indicates success
                          -> DWORD     -- ^ Number of bytes transferred
                          -> IO a
+
+newOverlapped :: Word64 -- ^ Offset/OffsetHigh
+              -> CompletionCallback ()
+              -> IO Overlapped
+newOverlapped offset cb =
+    newOverlappedEx offset $ \errCode numBytes -> liftIO $ cb errCode numBytes
 
 -- | Start an overlapped I/O operation, and wait for its completion.  If
 -- 'withOverlapped' is interrupted by an asynchronous exception, the operation
@@ -217,41 +249,120 @@ withOverlapped :: Manager
                -> CompletionCallback a
                -> IO a
 withOverlapped mgr h offset startCB completionCB = do
-    hstate <- readIORef (managerHandles mgr)
-          >>= maybe failNotRegistered return . IM.lookup (handleToInt h)
+    signal <- newEmptyMVar
+    let signalReturn a = void $ tryPutMVar signal $ return a
+        signalThrow ex = void $ tryPutMVar signal $ throwIO (ex :: SomeException)
 
-    withWorkerAndMask mgr (hsPool hstate) $ \enqueue -> do
-        signal <- newEmptyMVar
-        let signalReturn a = void $ tryPutMVar signal $ return a
-            signalThrow ex = void $ tryPutMVar signal $ throwIO (ex :: SomeException)
-
+    mask_ $ withWorker mgr h $ \enqueue -> do
         enqueue $ do
             let completionCB' :: CompletionCallback ()
                 completionCB' e b =
                     (completionCB e b >>= signalReturn) `E.catch` signalThrow
 
-            e <- try $ FFI.newOverlapped offset completionCB'
+            e <- try $ newOverlapped offset completionCB'
             case e of
                 Left ex -> signalThrow ex
-                Right ol@(FFI.Overlapped ptr) ->
-                    startCB ptr `E.catch` \ex -> do
-                        FFI.discardOverlapped ol
+                Right ol ->
+                    startCB ol `E.catch` \ex -> do
+                        discardOverlapped ol
                         signalThrow ex
 
         let cancel = uninterruptibleMask_ $ do
+                cancelDone <- newEmptyMVar
                 enqueue $ do
-                    -- NOTE: This may run after 'withOverlapped' has completed.
-                    -- The 'hsClosed' lock is how we keep the handle from being
-                    -- closed under us.
-                    closed <- takeMVar (hsClosed hstate)
-                    when (not closed) $
-                        FFI.cancelIo h `E.catch` \ex -> do
-                            traceIO $ "CancelIo failed: " ++ show (ex :: SomeException)
-                            signalThrow ex
-                    putMVar (hsClosed hstate) closed
-                takeMVar signal
+                    FFI.cancelIo h `E.catch` \ex -> do
+                        traceIO $ "CancelIo failed: " ++ show (ex :: SomeException)
+                        signalThrow ex
+                    putMVar cancelDone ()
+                _ <- takeMVar signal
+                takeMVar cancelDone
 
         join (takeMVar signal `onException` cancel)
 
+------------------------------------------------------------------------
+-- Worker allocation
+
+type WorkerMap = IM.IntMap Pool
+
+-- | Used to allocate worker threads for I/O requests.  The rule is: a handle
+-- may not use the same worker for two simultaneous operations (however,
+-- multiple handles may share the same worker).  This is because CancelIo
+-- cancels all pending I/O for a given handle in the current thread.
+-- CancelIoEx would let us specify an individual operation to cancel,
+-- but it was introduced in Windows Vista.
+--
+-- Whenever we can, we queue jobs to the completion handler using
+-- 'postIO'.  This is about 30% faster than using a separate
+-- worker thread, as it avoids a context switch.
+data Pool = Pool
+    { pCompletionPort :: !Bool
+    , pWorkers        :: WorkerList
+    , pRefCount       :: !Int
+        -- ^ Number of in-progress 'withWorker' calls.  When this drops to
+        --   zero, we can remove this entry from the 'WorkerMap'.
+    }
+
+data WorkerList = WL !Worker WorkerList
+
+-- | Nifty trick to allow each 'Pool' to allocate workers per concurrent
+-- operation, while allowing 'Pool's to share workers.
+newWorkerList :: IO WorkerList
+newWorkerList = unsafeInterleaveIO $ do
+    w  <- Worker.new
+    ws <- newWorkerList
+    return (WL w ws)
+{-# NOINLINE newWorkerList #-}
+
+type Enqueue = IO () -> IO ()
+
+type ReleaseF = WorkerMap -> (WorkerMap, ())
+
+withWorker :: Manager -> HANDLE -> (Enqueue -> IO a) -> IO a
+withWorker mgr@Manager{..} h cb =
+    mask $ \restore -> do
+        (enqueue, releaseF) <- atomicModifyIORef mgrWorkerMap grabF
+        let release = atomicModifyIORef mgrWorkerMap releaseF
+                  >>= evaluate
+        a <- restore (cb enqueue) `onException` release
+        release
+        return a
   where
-    failNotRegistered = fail "IOCP.Manager.withOverlapped: handle closed or not registered"
+    key = (fromIntegral . ptrToIntPtr) h :: Int
+
+    grabF :: WorkerMap -> (WorkerMap, (Enqueue, ReleaseF))
+    grabF m =
+        case IM.lookup key m of
+            Nothing ->
+                let !pool = Pool False mgrWorkers 1
+                    !m'   = IM.insert key pool m
+                 in (m', (postIO mgr, releaseCP))
+            Just Pool{..}
+              | pCompletionPort ->
+                let !pool = Pool False pWorkers (pRefCount + 1)
+                    !m'   = IM.insert key pool m
+                 in (m', (postIO mgr, releaseCP))
+              | WL w ws <- pWorkers ->
+                let !pool = Pool pCompletionPort ws (pRefCount + 1)
+                    !m'   = IM.insert key pool m
+                 in (m', (Worker.enqueue w, releaseWorker w))
+
+    releaseCP :: ReleaseF
+    releaseCP = releaseWith $ \Pool{..} ->
+        Pool True pWorkers (pRefCount - 1)
+
+    releaseWorker :: Worker -> ReleaseF
+    releaseWorker w = releaseWith $ \Pool{..} ->
+        Pool pCompletionPort (WL w pWorkers) (pRefCount - 1)
+
+    releaseWith :: (Pool -> Pool) -> ReleaseF
+    releaseWith f m =
+        case IM.lookup key m of
+            Nothing -> (m, ())  -- should never happen
+            Just pool
+              | pRefCount pool <= 1 ->
+                let !m' = IM.delete key m
+                 in (m', ())
+              | otherwise ->
+                let !pool' = f pool
+                    !m'    = IM.insert key pool' m
+                 in (m', ())
