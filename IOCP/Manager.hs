@@ -44,6 +44,9 @@ import System.Win32.Types
 
 import qualified Data.IntMap as IM
 
+------------------------------------------------------------------------
+-- Manager
+
 data Manager = Manager
     { mgrIOCP      :: !(FFI.IOCP ManagerCallback)
     , mgrClock     :: !Clock
@@ -52,19 +55,6 @@ data Manager = Manager
     }
 
 type ManagerCallback = ErrCode -> DWORD -> Mgr ()
-
-type TimeoutQueue = Q.PSQ TimeoutCallback
-
--- |
--- Warning: since the 'TimeoutCallback' is called from the I/O manager, it must
--- not throw an exception or block for a long period of time.  In particular,
--- be wary of 'Control.Exception.throwTo' and 'Control.Concurrent.killThread':
--- if the target thread is making a foreign call, these functions will block
--- until the call completes.
-type TimeoutCallback = IO ()
-
-newtype TimeoutKey = TK Unique
-    deriving (Eq, Ord)
 
 new :: IO Manager
 new = do
@@ -86,16 +76,8 @@ managerRef = unsafePerformIO $
         else newIORef Nothing
 {-# NOINLINE managerRef #-}
 
--- | Variant of 'newOverlapped' that allows the callback to modify the
--- timeout queue.
-newOverlappedEx :: Word64 -> ManagerCallback -> IO Overlapped
-newOverlappedEx = FFI.newOverlapped
-
-discardOverlapped :: Overlapped -> IO ()
-discardOverlapped = FFI.discardOverlapped
-
-postOverlapped :: Manager -> Overlapped -> IO ()
-postOverlapped mgr = FFI.postCompletion (mgrIOCP mgr) 0
+newOverlapped :: Word64 -> ManagerCallback -> IO Overlapped
+newOverlapped = FFI.newOverlapped
 
 -- | Queue an action to be performed by the I/O manager thread.
 postIO :: Manager -> IO () -> IO ()
@@ -104,8 +86,88 @@ postIO mgr = postMgr mgr . liftIO
 -- | Variant of 'postIO' that allows the callback to modify the
 -- timeout queue.
 postMgr :: Manager -> Mgr () -> IO ()
-postMgr mgr cb =
-    newOverlappedEx 0 (\_errCode _numBytes -> cb) >>= postOverlapped mgr
+postMgr mgr cb = newOverlapped 0 (\_errCode _numBytes -> cb)
+             >>= FFI.postCompletion (mgrIOCP mgr) 0
+
+------------------------------------------------------------------------
+-- Overlapped I/O
+
+-- | Callback that starts the overlapped I/O operation.
+-- It must return successfully if and only if an I/O completion has been
+-- queued.  Otherwise, it must throw an exception, which 'withOverlapped'
+-- will rethrow.
+type StartCallback = Overlapped -> IO ()
+
+-- | Called when the completion is delivered.
+type CompletionCallback a = ErrCode   -- ^ 0 indicates success
+                         -> DWORD     -- ^ Number of bytes transferred
+                         -> IO a
+
+-- | Associate a 'HANDLE' with the I/O manager's completion port.  This must be
+-- done before using the handle with 'withOverlapped'.
+associateHandle :: Manager -> HANDLE -> IO ()
+associateHandle Manager{..} h =
+    FFI.associateHandleWithIOCP mgrIOCP h
+
+-- | Start an overlapped I/O operation, and wait for its completion.  If
+-- 'withOverlapped' is interrupted by an asynchronous exception, the operation
+-- will be canceled using @CancelIo@.
+--
+-- 'withOverlapped' waits for a completion to arrive before returning or
+-- throwing an exception.  This means you can use functions like
+-- 'Foreign.Marshal.Alloc.alloca' to allocate buffers for the operation.
+withOverlapped :: Manager
+               -> HANDLE
+               -> Word64 -- ^ Value to use for the @OVERLAPPED@
+                         --   structure's Offset/OffsetHigh members.
+               -> StartCallback
+               -> CompletionCallback a
+               -> IO a
+withOverlapped mgr h offset startCB completionCB = do
+    signal <- newEmptyMVar
+    let signalReturn a = void $ tryPutMVar signal $ return a
+        signalThrow ex = void $ tryPutMVar signal $ throwIO (ex :: SomeException)
+
+    mask_ $ withWorker mgr h $ \enqueue -> do
+        enqueue $ do
+            let completionCB' e b = liftIO $
+                    (completionCB e b >>= signalReturn) `E.catch` signalThrow
+
+            e <- try $ newOverlapped offset completionCB'
+            case e of
+                Left ex -> signalThrow ex
+                Right ol ->
+                    startCB ol `E.catch` \ex -> do
+                        FFI.discardOverlapped ol
+                        signalThrow ex
+
+        let cancel = uninterruptibleMask_ $ do
+                cancelDone <- newEmptyMVar
+                enqueue $ do
+                    FFI.cancelIo h `E.catch` \ex -> do
+                        traceIO $ "CancelIo failed: " ++ show (ex :: SomeException)
+                        signalThrow ex
+                    putMVar cancelDone ()
+                _ <- takeMVar signal
+                takeMVar cancelDone
+
+        join (takeMVar signal `onException` cancel)
+
+------------------------------------------------------------------------
+-- Timeouts
+
+type TimeoutQueue = Q.PSQ TimeoutCallback
+
+-- |
+-- Warning: since the 'TimeoutCallback' is called from the I/O manager, it must
+-- not throw an exception or block for a long period of time.  In particular,
+-- be wary of 'Control.Exception.throwTo' and 'Control.Concurrent.killThread':
+-- if the target thread is making a foreign call, these functions will block
+-- until the call completes.
+type TimeoutCallback = IO ()
+
+newtype TimeoutKey = TK Unique
+    deriving (Eq, Ord)
 
 -- | Register an action to be performed in the given number of seconds.  The
 -- returned 'TimeoutKey' can be used to later unregister or update the timeout.
@@ -207,77 +269,6 @@ step mgr@Manager{..} = do
 loop :: Manager -> IO loop
 loop mgr = go Q.empty
   where go s = runMgr (step mgr) s >>= go . snd
-
-------------------------------------------------------------------------
--- Overlapped I/O
-
--- | Associate a 'HANDLE' with the I/O manager's completion port.  This must be
--- done before using the handle with 'withOverlapped'.
-associateHandle :: Manager -> HANDLE -> IO ()
-associateHandle Manager{..} h =
-    FFI.associateHandleWithIOCP mgrIOCP h
-
--- | Callback that starts the overlapped I/O operation.
--- It must return successfully if and only if an I/O completion has been
--- queued.  Otherwise, it must throw an exception, which 'withOverlapped'
--- will rethrow.
-type StartCallback = Overlapped -> IO ()
-
--- | Called when the completion is delivered.
-type CompletionCallback a = ErrCode   -- ^ 0 indicates success
-                         -> DWORD     -- ^ Number of bytes transferred
-                         -> IO a
-
-newOverlapped :: Word64 -- ^ Offset/OffsetHigh
-              -> CompletionCallback ()
-              -> IO Overlapped
-newOverlapped offset cb =
-    newOverlappedEx offset $ \errCode numBytes -> liftIO $ cb errCode numBytes
-
--- | Start an overlapped I/O operation, and wait for its completion.  If
--- 'withOverlapped' is interrupted by an asynchronous exception, the operation
--- will be canceled using @CancelIo@.
---
--- 'withOverlapped' waits for a completion to arrive before returning or
--- throwing an exception.  This means you can use functions like
--- 'Foreign.Marshal.Alloc.alloca' to allocate buffers for the operation.
-withOverlapped :: Manager
-               -> HANDLE
-               -> Word64 -- ^ Value to use for the @OVERLAPPED@
-                         --   structure's Offset/OffsetHigh members.
-               -> StartCallback
-               -> CompletionCallback a
-               -> IO a
-withOverlapped mgr h offset startCB completionCB = do
-    signal <- newEmptyMVar
-    let signalReturn a = void $ tryPutMVar signal $ return a
-        signalThrow ex = void $ tryPutMVar signal $ throwIO (ex :: SomeException)
-
-    mask_ $ withWorker mgr h $ \enqueue -> do
-        enqueue $ do
-            let completionCB' :: CompletionCallback ()
-                completionCB' e b =
-                    (completionCB e b >>= signalReturn) `E.catch` signalThrow
-
-            e <- try $ newOverlapped offset completionCB'
-            case e of
-                Left ex -> signalThrow ex
-                Right ol ->
-                    startCB ol `E.catch` \ex -> do
-                        discardOverlapped ol
-                        signalThrow ex
-
-        let cancel = uninterruptibleMask_ $ do
-                cancelDone <- newEmptyMVar
-                enqueue $ do
-                    FFI.cancelIo h `E.catch` \ex -> do
-                        traceIO $ "CancelIo failed: " ++ show (ex :: SomeException)
-                        signalThrow ex
-                    putMVar cancelDone ()
-                _ <- takeMVar signal
-                takeMVar cancelDone
-
-        join (takeMVar signal `onException` cancel)
 
 ------------------------------------------------------------------------
 -- Worker allocation
